@@ -14,6 +14,7 @@ from scripts.portfolio_review_validator import (  # noqa: E402
     DEFAULT_ARTIFACTS,
     PathRefused,
     build_review,
+    print_review,
     validate_artifact_path,
 )
 
@@ -89,3 +90,24 @@ def test_build_review_reads_only_default_artifacts(tmp_path: Path) -> None:
 
     assert sorted(review["artifacts"]) == sorted(path.as_posix() for path in DEFAULT_ARTIFACTS)
     assert all(item["status"] == "read" for item in review["artifacts"].values())
+
+
+def test_stdout_contains_required_operator_sections(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    _write_default_artifacts(tmp_path)
+
+    print_review(build_review(tmp_path))
+    output = capsys.readouterr().out
+
+    assert "Artifacts read:" in output
+    assert "Artifacts missing or unreadable:" in output
+    assert "Portfolio summary:" in output
+    assert "No-write checklist:" in output
+
+
+def test_output_contract_examples_are_marked_sample_only() -> None:
+    contract = (_REPO_ROOT / "docs" / "portfolio-review-output-contract.md").read_text(encoding="utf-8")
+
+    assert contract.count("SAMPLE ONLY") >= 2
+    assert "fake and are not live account data" in contract
+    assert "SAMPLE_S01" in contract
+    assert "SAMPLE_S02" in contract

@@ -74,6 +74,9 @@ override/promotion artifacts, broad candidate directories, and any
 non-allowlisted path. It prints the portfolio summary and no-write checklist to
 stdout and writes no report file.
 
+See `docs/portfolio-review-output-contract.md` for the stdout section contract,
+schema notes, and sample operator output.
+
 ## Runner Checklist
 
 1. State the requested review scope and repositories.
