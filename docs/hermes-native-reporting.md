@@ -75,6 +75,12 @@ For machine-readable output:
 python3 scripts/portfolio_operator_report.py --json
 ```
 
+For a markdown daily operator summary, use:
+
+```bash
+python3 scripts/daily_portfolio_report.py
+```
+
 ## Expected Text Output
 
 ```text
