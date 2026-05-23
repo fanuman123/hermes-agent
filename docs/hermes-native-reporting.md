@@ -2,19 +2,25 @@
 
 ## Purpose
 
-Hermes-native reporting provides a small read-only operator report for Kraken
-Bot V2 portfolio posture. It starts replacing the basic OpenClaw reporting
-slice that answered: "what is the current portfolio posture, and should the
-operator observe or investigate?"
+Hermes-native reporting provides read-only operator reports for Kraken Bot V2
+portfolio posture and bounded advisory summaries. It replaces the core OpenClaw
+operator/advisory reporting slices that answered:
+
+- what is the current portfolio posture,
+- should the operator observe or investigate,
+- what does the recent historical trade posture look like,
+- how does Hermes posture compare with legacy OpenClaw posture,
+- why would a posture be considered healthy, degraded, or blocked for human
+  advisory review.
 
 This is a reporting layer only. Kraken Bot V2 remains the only execution
 authority. Hermes does not place orders, cancel orders, rebalance, repair
 state, mutate config, write overrides, promote policies, or change live bot
 behavior.
 
-## Replaced OpenClaw Reporting Slice
+## Replaced OpenClaw Reporting Slices
 
-The command replaces basic posture reporting:
+Hermes replaces basic posture reporting:
 
 - strategy name from current snapshots,
 - snapshot timestamp,
@@ -26,20 +32,30 @@ The command replaces basic posture reporting:
 - compact posture classification,
 - recommended operator action.
 
-It is suitable for Telegram-sized operator status updates.
+Hermes also replaces the primary OpenClaw advisory reporting slices with:
+
+- `scripts/historical_trade_summary.py` for bounded trade/fill summaries,
+- `scripts/advisory_comparison_report.py` for Hermes-vs-legacy OpenClaw
+  posture comparison,
+- `scripts/promotion_reasoning_summary.py` for advisory-only
+  promotion/override reasoning.
+
+The portfolio operator report remains suitable for Telegram-sized operator
+status updates. The advisory commands are terminal/stdout reporting tools and
+do not add Telegram-specific behavior.
 
 ## Still OpenClaw-Owned
 
-OpenClaw remains legacy/comparison-only for richer historical and advisory
-analysis until explicit migration work replaces those surfaces. This command
-does not replace:
+OpenClaw remains legacy/comparison-only for archived context and richer
+historical research that is not yet represented by bounded Hermes scripts. The
+Hermes commands do not replace:
 
-- historical trade research,
-- advisory policy analysis,
 - backtest reports,
-- OpenClaw-specific comparison notes,
+- OpenClaw-specific historical report formats,
 - migration planning,
-- strategy promotion or override reasoning.
+- scheduler ownership,
+- strategy promotion execution,
+- override mutation.
 
 ## Allowed Inputs
 
@@ -80,6 +96,16 @@ For a markdown daily operator summary, use:
 ```bash
 python3 scripts/daily_portfolio_report.py
 ```
+
+For migrated advisory summaries, use:
+
+```bash
+python3 scripts/historical_trade_summary.py
+python3 scripts/advisory_comparison_report.py
+python3 scripts/promotion_reasoning_summary.py
+```
+
+See `docs/hermes-advisory-migration.md` for the full migration contract.
 
 ## Expected Text Output
 
@@ -158,3 +184,7 @@ outside the four allowlisted snapshot artifacts.
 Rollback is a no-op operationally: stop running the command. There is no
 runtime state, config, service, or exchange-side artifact to undo because the
 command is read-only and stdout-only.
+
+For the daily report, any optional file output is limited to
+`reports/daily/` inside the Hermes repo. Advisory commands write only to
+stdout.
