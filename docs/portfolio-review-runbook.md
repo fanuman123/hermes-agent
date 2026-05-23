@@ -34,32 +34,45 @@ Forbidden:
 
 ## Kraken Bot V2 Artifact Allowlist
 
-Read only these runtime artifact locations, and only as narrowly as needed:
+Default dry-run portfolio reviews must read only these four runtime artifacts:
+
+- `/opt/bots/kraken-bot-v2/data/state.json`
+- `/opt/bots/kraken-bot-v2/data/portfolio_snapshot.json`
+- `/opt/bots/kraken-bot-v2/data/open_orders_snapshot.json`
+- `/opt/bots/kraken-bot-v2/data/telegram_status.json`
+
+Non-default future candidates, not read by the dry-run validator unless a later
+runbook explicitly promotes them:
 
 - `logs/`
 - `reports/`
 - `artifacts/`
 - `runs/`
-- `data/`
-- `state/portfolio*`
-- `state/positions*`
-- `state/balances*`
-- `state/exposure*`
-- `state/risk*`
-- `state/paper*`
-- `state/live*`
-- `state/orders*` for historical observation only.
-- `state/trades*` for historical observation only.
 - `snapshots/`
 - `metrics/`
 - `backtests/`
 - `paper/`
-- `live/` for read-only observation only.
+- `live/`
+- `state/`
 
 Do not read or write secrets, launchd files, deployment files, override state,
 promotion state, execution control files, safety-gate state, or exchange-write
 configuration unless the user explicitly asks for a read-only source review and
 the file is necessary to interpret the portfolio.
+
+## Dry-Run Validator
+
+Run the Hermes-side validator from the Hermes repo:
+
+```bash
+python3 scripts/portfolio_review_validator.py
+```
+
+The validator reads only the four default JSON artifacts above. It refuses
+`.env`, `strategy_overrides.json`, OpenClaw-linked symlink paths,
+override/promotion artifacts, broad candidate directories, and any
+non-allowlisted path. It prints the portfolio summary and no-write checklist to
+stdout and writes no report file.
 
 ## Runner Checklist
 
@@ -68,9 +81,8 @@ the file is necessary to interpret the portfolio.
    - `git -C <hermes> status --short`
    - `git -C <kraken-bot-v2> status --short`
    - `git -C <openclaw> status --short`
-3. Identify the smallest set of source files required to understand artifact
-   schemas, paper/live separation, and risk calculations.
-4. Read Kraken Bot V2 artifacts only from the allowlist.
+3. Prefer the dry-run validator for default reviews.
+4. If manual review is required, read only the four default JSON artifacts.
 5. Read OpenClaw advisory outputs only for comparison. Do not propose OpenClaw
    behavior as an execution change.
 6. Produce the review in the chat response:
