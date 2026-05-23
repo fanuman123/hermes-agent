@@ -63,6 +63,12 @@ From the Hermes repo:
 python3 scripts/portfolio_operator_report.py
 ```
 
+The default freshness threshold is 30 minutes. To change it:
+
+```bash
+python3 scripts/portfolio_operator_report.py --stale-after-minutes 45
+```
+
 For machine-readable output:
 
 ```bash
@@ -82,6 +88,11 @@ exposure_pct: 0.0
 entries_allowed: True
 entry_paused: False
 posture: FLAT
+freshness_status: fresh
+data_age_minutes: 10.0
+health_status: HEALTHY
+health_reasons:
+- none
 recommended_operator_action: observe
 safety: read-only Hermes report; Kraken Bot V2 remains execution authority.
 safety: no writes, no orders, no OpenClaw, no overrides/promotions.
@@ -101,6 +112,33 @@ The sample above is fake operator output, not live account data.
 
 These actions are operator guidance only. They are not permission to place,
 cancel, replay, rebalance, pause, unpause, or modify trading behavior.
+
+## Freshness and Health
+
+Freshness is based on `snapshot_ts_utc`, derived from
+`portfolio_snapshot.json.ts_utc` with a fallback to
+`open_orders_snapshot.json.ts_utc`.
+
+- `fresh`: the snapshot age is within the configured stale threshold.
+- `stale`: the snapshot is older than the configured stale threshold.
+- `missing_timestamp`: no usable timestamp is present.
+- `invalid_timestamp`: the timestamp cannot be parsed.
+
+Health is a conservative operator-readiness classification:
+
+- `HEALTHY`: all four artifacts are readable, timestamp is fresh, exposure is
+  parsed, and critical posture fields are present.
+- `DEGRADED`: metadata is incomplete or stale, but the report remains safe for
+  read-only operator interpretation.
+- `ATTENTION_REQUIRED`: a required artifact is missing/unreadable/refused, the
+  timestamp is invalid, exposure cannot be parsed, or position counts conflict.
+
+Recommended actions are bounded to human review:
+
+- `observe`: healthy flat posture.
+- `investigate`: degraded posture or active posture.
+- `pause-review-needed`: attention-required posture or entry-gate concern. This
+  means human review only; it does not pause the bot or modify any live setting.
 
 ## Read-Only Safety
 

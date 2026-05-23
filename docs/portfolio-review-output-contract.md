@@ -57,6 +57,15 @@ The current `Portfolio summary` section is a compact derived view:
   `telegram_status.json`.
 - `entry_paused`: from `state.json`.
 
+The Hermes-native operator report extends this derived view with:
+
+- `freshness_status`: one of `fresh`, `stale`, `missing_timestamp`, or
+  `invalid_timestamp`.
+- `data_age_minutes`: age of the selected snapshot timestamp when available.
+- `health_status`: one of `HEALTHY`, `DEGRADED`, or `ATTENTION_REQUIRED`.
+- `health_reasons`: flat list of reasons explaining degraded or
+  attention-required output.
+
 Missing or malformed artifacts should produce `unknown` summary values rather
 than encouraging broader searches.
 
