@@ -2,6 +2,18 @@
 
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
 
+## Bounded Workspace Operating Rules
+
+For sensitive operator/control-plane work, use CURRENT_STATE-first and source-first verification:
+
+- Read `docs/AI_OPERATOR_RULES.md`, `docs/CURRENT_STATE.md`, `docs/LATEST_AGENT_LAB.md`, `docs/task_context/*`, and workspace adapter docs where present before acting on generated summaries.
+- Treat generated context as advisory; source files, committed docs, config schemas, and explicit runtime artifacts are the source of truth when conflicts exist.
+- Keep initial investigation bounded: inspect at most 8 files, use repo-scoped paths, avoid filesystem-wide scans, and do not recursively crawl repositories by default.
+- Avoid recursive tool loops, broad delegation, background jobs, and long autonomous investigations unless explicitly requested.
+- Preserve live trading safety gates. Hermes may provide operator review/control-plane guidance, but Kraken Bot V2 remains the only live execution authority.
+- Do not modify OpenClaw, Kraken Bot V2, launchd services, `.env` files, runtime state, overrides, promotion files, or live execution code unless the operator explicitly approves that scope.
+- Prefer branch/PR workflow through GitHub integration for repository changes; do not commit directly to `main` when a PR path is available.
+
 ## Development Environment
 
 ```bash
