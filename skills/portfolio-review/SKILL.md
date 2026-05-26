@@ -190,6 +190,9 @@ artifacts, broad candidate directories, and any non-allowlisted path. It prints
 the portfolio summary and no-write checklist to stdout and writes no report
 file.
 
+Use `docs/portfolio-review-output-contract.md` as the reporting contract for
+stdout sections, schema notes, sample output, and operator interpretation.
+
 ## Procedure
 
 1. Record the repositories and absolute paths in scope.
