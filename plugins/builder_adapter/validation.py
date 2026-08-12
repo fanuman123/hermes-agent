@@ -7,6 +7,7 @@ import json
 import os
 import plistlib
 import secrets
+import stat
 import subprocess
 import sys
 import tempfile
@@ -308,6 +309,31 @@ class _DockerContainment:
                     "validation source contains a non-regular Git object",
                 )
 
+    @staticmethod
+    def _verify_materialized_regular_tree(worktree: Path) -> None:
+        """Verify a plumbing-materialized tree that intentionally has no .git."""
+        for raw_root, directories, files in os.walk(worktree, followlinks=False):
+            root = Path(raw_root)
+            root_info = root.lstat()
+            if root.is_symlink() or not stat.S_ISDIR(root_info.st_mode):
+                raise AdapterError(
+                    "MANIFEST_MISMATCH", "validation source contains an unsafe directory"
+                )
+            for name in directories:
+                path = root / name
+                info = path.lstat()
+                if path.is_symlink() or not stat.S_ISDIR(info.st_mode):
+                    raise AdapterError(
+                        "MANIFEST_MISMATCH", "validation source contains an unsafe directory"
+                    )
+            for name in files:
+                path = root / name
+                info = path.lstat()
+                if path.is_symlink() or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise AdapterError(
+                        "MANIFEST_MISMATCH", "validation source contains an unsafe file"
+                    )
+
     def run(
         self,
         profile_id: str,
@@ -316,8 +342,12 @@ class _DockerContainment:
         commit: str,
         *,
         scope_id: str,
+        materialized: bool = False,
     ) -> dict:
-        self._verify_regular_tree(worktree, commit)
+        if materialized:
+            self._verify_materialized_regular_tree(worktree)
+        else:
+            self._verify_regular_tree(worktree, commit)
         safe_scope = "".join(
             character if character.isalnum() else "-"
             for character in scope_id[:36]
@@ -589,6 +619,7 @@ class ValidationRunner:
                 worktree,
                 expected_sha,
                 scope_id=scope_id,
+                materialized=materialized_sha is not None,
             )
         raise AdapterError(
             "VALIDATION_CONTAINMENT_UNAVAILABLE",

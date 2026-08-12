@@ -10,6 +10,7 @@ import pytest
 from plugins.builder_adapter.errors import AdapterError
 from plugins.builder_adapter.validation import (
     ValidationRunner,
+    _DockerContainment,
     _UnverifiedLaunchdContainmentProbe,
 )
 
@@ -95,6 +96,25 @@ def test_expected_sha_mismatch_runs_nothing(tmp_path):
     with pytest.raises(AdapterError) as raised:
         runner.run("profile", tmp_path, "f" * 40)
     assert raised.value.code == "HEAD_MISMATCH"
+
+
+def test_materialized_regular_tree_needs_no_git_metadata(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "package").mkdir()
+    (source / "package" / "module.py").write_text("value = 1\n")
+    _DockerContainment._verify_materialized_regular_tree(source)
+
+
+def test_materialized_regular_tree_rejects_symlinks(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    target = tmp_path / "outside.py"
+    target.write_text("value = 1\n")
+    (source / "module.py").symlink_to(target)
+    with pytest.raises(AdapterError) as raised:
+        _DockerContainment._verify_materialized_regular_tree(source)
+    assert raised.value.code == "MANIFEST_MISMATCH"
 
 
 @pytest.mark.live_system_guard_bypass
