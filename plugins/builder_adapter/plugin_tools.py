@@ -30,6 +30,16 @@ class ToolContext:
     packet: dict
 
 
+def _validation_runner(profile_id: str, profile: dict, adapter_config: dict) -> ValidationRunner:
+    return ValidationRunner(
+        {profile_id: profile},
+        python=os.sys.executable,
+        docker=adapter_config.get("validation_docker_binary"),
+        docker_host=adapter_config.get("validation_docker_host"),
+        image_id=adapter_config.get("validation_image_id"),
+    )
+
+
 def _context() -> ToolContext:
     try:
         worker_tools = json.loads(
@@ -94,9 +104,7 @@ def _context() -> ToolContext:
         root=root,
         manifest=manifest,
         tools=ConfinedTools(root, manifest, readable_paths),
-        validation=ValidationRunner(
-            {request.validation_profile: profile}, python=os.sys.executable
-        ),
+        validation=_validation_runner(request.validation_profile, profile, adapter_config),
         packet=packet,
     )
 
