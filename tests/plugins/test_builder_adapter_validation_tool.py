@@ -117,6 +117,27 @@ def test_materialized_regular_tree_rejects_symlinks(tmp_path):
     assert raised.value.code == "MANIFEST_MISMATCH"
 
 
+def test_materialized_tree_archive_does_not_require_git_metadata(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    assert _DockerContainment._archive_argv(
+        source, "a" * 40, materialized=True
+    ) == ["/usr/bin/tar", "-cf", "-", "-C", str(source), "."]
+
+
+def test_git_tree_archive_remains_commit_bound(tmp_path):
+    assert _DockerContainment._archive_argv(
+        tmp_path, "a" * 40, materialized=False
+    ) == [
+        "/usr/bin/git",
+        "-C",
+        str(tmp_path),
+        "archive",
+        "--format=tar",
+        "a" * 40,
+    ]
+
+
 @pytest.mark.live_system_guard_bypass
 @pytest.mark.parametrize(
     ("mode", "timeout_seconds", "expected_status", "descendants_escape"),

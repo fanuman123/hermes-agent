@@ -334,6 +334,19 @@ class _DockerContainment:
                         "MANIFEST_MISMATCH", "validation source contains an unsafe file"
                     )
 
+    @staticmethod
+    def _archive_argv(worktree: Path, commit: str, *, materialized: bool) -> list[str]:
+        if materialized:
+            return ["/usr/bin/tar", "-cf", "-", "-C", str(worktree), "."]
+        return [
+            "/usr/bin/git",
+            "-C",
+            str(worktree),
+            "archive",
+            "--format=tar",
+            commit,
+        ]
+
     def run(
         self,
         profile_id: str,
@@ -384,14 +397,9 @@ class _DockerContainment:
                 )
                 volume_created = True
                 archive = subprocess.Popen(
-                    [
-                        "/usr/bin/git",
-                        "-C",
-                        str(worktree),
-                        "archive",
-                        "--format=tar",
-                        commit,
-                    ],
+                    self._archive_argv(
+                        worktree, commit, materialized=materialized
+                    ),
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     env={
