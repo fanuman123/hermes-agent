@@ -517,7 +517,7 @@ class BuilderDispatchAdapter:
             )
             evidence = completion.complete(
                 request,
-                governance_snapshot,
+                task_snapshot,
                 record["principal"],
                 record["request_sha256"],
                 manifest,
