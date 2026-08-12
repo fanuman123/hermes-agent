@@ -372,32 +372,41 @@ class _DockerContainment:
                     },
                 )
                 assert archive.stdout is not None
-                populated = subprocess.run(
-                    [
-                        self.docker,
-                        "run",
-                        "--rm",
-                        "-i",
-                        "--network",
-                        "none",
-                        "--read-only",
-                        "--user",
-                        "0:0",
-                        "--entrypoint",
-                        "/bin/tar",
-                        "--mount",
-                        f"type=volume,src={volume},dst=/work/source",
-                        self.image_id,
-                        "-xf",
-                        "-",
-                        "-C",
-                        "/work/source",
-                    ],
-                    stdin=archive.stdout,
-                    capture_output=True,
-                    timeout=300,
-                    env=self._environment(docker_config),
-                )
+                try:
+                    populated = subprocess.run(
+                        [
+                            self.docker,
+                            "run",
+                            "--rm",
+                            "-i",
+                            "--network",
+                            "none",
+                            "--read-only",
+                            "--user",
+                            "0:0",
+                            "--entrypoint",
+                            "/bin/tar",
+                            "--mount",
+                            f"type=volume,src={volume},dst=/work/source",
+                            self.image_id,
+                            "-xf",
+                            "-",
+                            "-C",
+                            "/work/source",
+                        ],
+                        stdin=archive.stdout,
+                        capture_output=True,
+                        timeout=1200,
+                        env=self._environment(docker_config),
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    archive.stdout.close()
+                    archive.kill()
+                    archive.communicate()
+                    raise AdapterError(
+                        "VALIDATION_CONTAINMENT_UNAVAILABLE",
+                        "sealed source export timed out",
+                    ) from exc
                 archive.stdout.close()
                 archive_stderr = archive.communicate(timeout=30)[1]
                 if archive.returncode != 0 or populated.returncode != 0:
