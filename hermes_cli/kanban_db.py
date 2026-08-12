@@ -7814,6 +7814,7 @@ _RECENT_WORKER_EXIT_TTL_SECONDS = 600
 _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float, Optional[str], Optional[int]]]" = {}
 _worker_process_identities: "dict[int, tuple[str, int]]" = {}
+_worker_process_handles: "dict[int, object]" = {}
 
 
 class _DarwinProcBsdInfo(ctypes.Structure):
@@ -7898,6 +7899,7 @@ def _record_worker_exit(pid: int, raw_status: int) -> None:
     """
     if not pid or pid <= 0:
         return
+    _worker_process_handles.pop(int(pid), None)
     now = time.time()
     identity, run_id = _worker_process_identities.pop(
         int(pid), (None, None)
@@ -10577,11 +10579,11 @@ def _default_spawn(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
         )
-    # NOTE: we intentionally do NOT close log_f here — we want Popen's
-    # child process to keep writing after this function returns.  The
-    # handle is kept alive by the child's inheritance.  The parent's
-    # reference goes out of scope and is GC'd, but the OS-level FD stays
-    # open in the child until the child exits.
+    # Retain the Popen object until the central zombie reaper records the
+    # raw wait status. Dropping it here lets subprocess object cleanup reap
+    # the child first, which destroys the exit proof required by governed
+    # completion. The reaper removes the bounded handle entry.
+    _worker_process_handles[int(proc.pid)] = proc
     return proc.pid
 
 
