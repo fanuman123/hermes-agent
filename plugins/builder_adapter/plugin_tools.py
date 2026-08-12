@@ -27,6 +27,8 @@ class ToolContext:
     manifest: object
     tools: ConfinedTools
     validation: ValidationRunner
+    store: DispatchStore
+    task_id: str
     packet: dict
 
 
@@ -105,6 +107,8 @@ def _context() -> ToolContext:
         manifest=manifest,
         tools=ConfinedTools(root, manifest, readable_paths),
         validation=_validation_runner(request.validation_profile, profile, adapter_config),
+        store=store,
+        task_id=task_id,
         packet=packet,
     )
 
@@ -192,13 +196,28 @@ def handle_validation(context: ToolContext, args: dict):
         raise AdapterError("VALIDATION_FAILED", "validation binding mismatch")
     temporary, checkout, commit = _validation_snapshot(context)
     try:
-        return context.validation.run(
+        validation = context.validation.run(
             args["profile_id"],
             checkout,
             commit,
             materialized_sha=commit,
             scope_id=str(context.request.dispatch_id),
         )
+        if validation["overall_status"] == "PASSED":
+            tree = _run_git(context.root, "rev-parse", f"{commit}^{{tree}}").stdout.decode().strip()
+            context.store.record_validation_receipt(
+                {
+                    "schema_version": "1.0.0",
+                    "dispatch_id": str(context.request.dispatch_id),
+                    "task_id": context.task_id,
+                    "profile_id": args["profile_id"],
+                    "expected_head_sha": context.request.expected_head_sha,
+                    "snapshot_sha": commit,
+                    "tree_sha": tree,
+                    "validation": validation,
+                }
+            )
+        return validation
     finally:
         temporary.cleanup()
 

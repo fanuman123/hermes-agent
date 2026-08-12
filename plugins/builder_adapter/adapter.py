@@ -514,6 +514,7 @@ class BuilderDispatchAdapter:
                 self.validation,
                 self.schemas,
                 effective_profile,
+                self.store,
             )
             evidence = completion.complete(
                 request,
