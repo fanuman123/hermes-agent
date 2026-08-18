@@ -138,6 +138,7 @@ def test_git_tree_archive_remains_commit_bound(tmp_path):
     ]
 
 
+@pytest.mark.macos_only
 @pytest.mark.live_system_guard_bypass
 @pytest.mark.parametrize(
     ("mode", "timeout_seconds", "expected_status", "descendants_escape"),

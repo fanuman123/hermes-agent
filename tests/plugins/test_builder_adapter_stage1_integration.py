@@ -10,6 +10,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from plugins.builder_adapter import plugin_tools
 from plugins.builder_adapter.adapter import BuilderDispatchAdapter
 from plugins.builder_adapter.attestation import (
@@ -52,6 +54,7 @@ def _schema_registry(snapshot: GovernanceSnapshot, root: Path) -> SchemaRegistry
     return SchemaRegistry(paths)
 
 
+@pytest.mark.integration
 def test_exact_stage1_snapshot_preflight_tool_context_and_fail_closed_validation(
     tmp_path, monkeypatch
 ):
