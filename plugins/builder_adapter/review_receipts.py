@@ -125,6 +125,22 @@ _CREDENTIAL_KEY_MARKERS = (
 )
 
 
+def _posix_effective_uid() -> int:
+    """Return the POSIX effective UID or fail closed on unsupported hosts."""
+    getter = getattr(os, "geteuid", None)
+    if not callable(getter):
+        raise AdapterError(
+            "CODEX_UNAVAILABLE",
+            "POSIX effective-user identity checks are unavailable",
+        )
+    uid = getter()
+    if not isinstance(uid, int) or isinstance(uid, bool) or uid < 0:
+        raise AdapterError(
+            "CODEX_UNAVAILABLE", "POSIX effective-user identity is invalid"
+        )
+    return uid
+
+
 def redact_secrets(value):
     """Scrub credential-shaped substrings inside string values, in place-ish.
 
@@ -892,7 +908,9 @@ class CodexReviewBackend:
             raise AdapterError(
                 "CODEX_UNAVAILABLE", "test sandbox launcher is unavailable"
             ) from exc
-        digest = self._hash_validated_launcher(resolved, expected_uid=os.geteuid())
+        digest = self._hash_validated_launcher(
+            resolved, expected_uid=_posix_effective_uid()
+        )
         if not hmac.compare_digest(digest, sandbox_launcher_sha256):
             raise AdapterError(
                 "CODEX_UNAVAILABLE", "test sandbox launcher identity mismatched"
@@ -989,8 +1007,9 @@ class CodexReviewBackend:
         try:
             info = os.fstat(descriptor)
             mode = stat.S_IMODE(info.st_mode)
-            expected_owners = {0, os.geteuid()}  # windows-footgun: ok
-            service_can_write = info.st_uid == os.geteuid() and bool(mode & 0o200)
+            effective_uid = _posix_effective_uid()
+            expected_owners = {0, effective_uid}
+            service_can_write = info.st_uid == effective_uid and bool(mode & 0o200)
             if (
                 not stat.S_ISREG(info.st_mode)
                 or info.st_nlink != 1
@@ -1307,7 +1326,7 @@ class CodexReviewBackend:
         if self._sandbox_launcher is not None:
             observed = self._hash_validated_launcher(
                 self._sandbox_launcher,
-                expected_uid=0 if sys.platform == "darwin" else os.geteuid(),
+                expected_uid=0 if sys.platform == "darwin" else _posix_effective_uid(),
             )
             if not hmac.compare_digest(observed, self._sandbox_launcher_sha256 or ""):
                 raise AdapterError(

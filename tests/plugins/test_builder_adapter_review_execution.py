@@ -10,8 +10,12 @@ from pathlib import Path
 
 import pytest
 
+from plugins.builder_adapter import review_receipts
 from plugins.builder_adapter.errors import AdapterError
-from plugins.builder_adapter.review_receipts import CodexReviewBackend, redact_secrets
+from plugins.builder_adapter.review_receipts import (
+    CodexReviewBackend,
+    redact_secrets,
+)
 
 
 def _git(*args: str) -> str:
@@ -55,6 +59,8 @@ def _runner(tmp_path: Path, body: str, *, name: str = "codex-test") -> Path:
     interpreter = (
         "/Library/Developer/CommandLineTools/usr/bin/python3"
         if sys.platform == "darwin"
+        else "/usr/bin/python3"
+        if sys.platform.startswith("linux")
         else sys.executable
     )
     path.write_text(f"#!{interpreter}\n{body}", encoding="utf-8")
@@ -307,6 +313,15 @@ def test_script_runner_requires_and_pins_interpreter(tmp_path):
             version="test",
             identity="codex_mcp",
         )
+
+
+def test_posix_effective_uid_fails_closed_when_unavailable(monkeypatch):
+    monkeypatch.delattr(review_receipts.os, "geteuid")
+
+    with pytest.raises(
+        AdapterError, match="POSIX effective-user identity checks are unavailable"
+    ):
+        review_receipts._posix_effective_uid()
 
 
 def test_invocation_describes_honest_sandbox_scope(tmp_path):

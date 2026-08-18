@@ -67,6 +67,8 @@ def make_git_worktree(tmp_path: Path) -> tuple[Path, str, str]:
 
     repo = base / "repo"
     _run_git("clone", "-q", "--no-hardlinks", str(source), str(repo))
+    _run_git("-C", str(repo), "config", "user.email", "test@example.invalid")
+    _run_git("-C", str(repo), "config", "user.name", "Test")
     worktree = base / "wt"
     _run_git(
         "-C", str(repo), "worktree", "add", "-q", "-b", BRANCH, str(worktree), starting_sha
@@ -95,6 +97,8 @@ def make_codex_executable(tmp_path: Path) -> str:
     interpreter = (
         "/Library/Developer/CommandLineTools/usr/bin/python3"
         if sys.platform == "darwin"
+        else "/usr/bin/python3"
+        if sys.platform.startswith("linux")
         else sys.executable
     )
     script.write_text(
