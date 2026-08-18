@@ -7930,7 +7930,7 @@ def _process_group_terminated(process_group: int) -> bool:
     if os.name == "nt" or process_group <= 0:
         return False
     try:
-        os.killpg(int(process_group), 0)
+        os.killpg(int(process_group), 0)  # windows-footgun: ok — POSIX-gated above
     except ProcessLookupError:
         return True
     except (PermissionError, OSError):

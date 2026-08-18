@@ -123,7 +123,7 @@ def _restart_launch_agent(args, settings, client) -> dict:
     if args.timeout <= 0 or args.timeout > 120:
         raise AdapterError("INVALID_REQUEST", "restart timeout must be 1-120 seconds")
 
-    target = f"gui/{os.getuid()}/{args.label}"
+    target = f"gui/{os.getuid()}/{args.label}"  # windows-footgun: ok — Darwin-only
     previous_process_id = None
     try:
         previous_process_id = client.health().get("process_id")

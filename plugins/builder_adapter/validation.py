@@ -87,7 +87,7 @@ def _darwin_user_temp_dir() -> Path:
             candidate.is_symlink()
             or not root.is_absolute()
             or not root.is_dir()
-            or stat.st_uid != os.getuid()
+            or stat.st_uid != os.getuid()  # windows-footgun: ok — Darwin-only
             or stat.st_mode & 0o077
         ):
             continue
@@ -122,7 +122,7 @@ class _UnverifiedLaunchdContainmentProbe:
                 "VALIDATION_CONTAINMENT_UNAVAILABLE",
                 "OS-owned disposable validation unit is unavailable",
             )
-        uid = os.getuid()
+        uid = os.getuid()  # windows-footgun: ok — Darwin-only
         token = secrets.token_hex(16)
         safe_scope = "".join(
             character if character.isalnum() else "-"
@@ -197,7 +197,9 @@ class _UnverifiedLaunchdContainmentProbe:
                 while time.monotonic() < deadline:
                     if result_path.is_file():
                         try:
-                            result = json.loads(result_path.read_text("utf-8"))
+                            result = json.loads(
+                                result_path.read_text(encoding="utf-8")
+                            )
                             break
                         except (OSError, ValueError):
                             supervisor_error = True

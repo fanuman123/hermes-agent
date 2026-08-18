@@ -268,7 +268,7 @@ async def bind_unix_socket(
         raise AdapterError("AUTHORIZATION_FAILED", "socket parent cannot be symlink")
     parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     parent_stat = os.fstat(parent_fd)
-    if parent_stat.st_uid != os.geteuid():
+    if parent_stat.st_uid != os.geteuid():  # windows-footgun: ok — Unix UDS service
         os.close(parent_fd)
         raise AdapterError("AUTHORIZATION_FAILED", "socket parent owner mismatch")
     if stat.S_IMODE(parent_stat.st_mode) != 0o700:
@@ -281,7 +281,7 @@ async def bind_unix_socket(
     site = web.UnixSite(runner, str(path))
     await site.start()
     socket_stat = path.lstat()
-    if not stat.S_ISSOCK(socket_stat.st_mode) or socket_stat.st_uid != os.geteuid():
+    if not stat.S_ISSOCK(socket_stat.st_mode) or socket_stat.st_uid != os.geteuid():  # windows-footgun: ok — Unix UDS service
         await runner.cleanup()
         raise AdapterError("INTERNAL_ERROR", "bound UDS identity mismatch")
     os.chmod(path, 0o600)

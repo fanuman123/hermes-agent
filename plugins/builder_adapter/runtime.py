@@ -91,7 +91,7 @@ def _read_owner_json(path: Path, *, exact_mode: int | None) -> dict:
         descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
         info = os.fstat(descriptor)
         if (
-            info.st_uid != os.geteuid()
+            info.st_uid != os.geteuid()  # windows-footgun: ok — Unix owner check
             or not stat.S_ISREG(info.st_mode)
             or info.st_nlink != 1
             or info.st_size > 1_000_000
@@ -146,7 +146,7 @@ def _read_owner_prompt(path: Path) -> str:
         descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
         info = os.fstat(descriptor)
         if (
-            info.st_uid != os.geteuid()
+            info.st_uid != os.geteuid()  # windows-footgun: ok — Unix owner check
             or not stat.S_ISREG(info.st_mode)
             or info.st_nlink != 1
             or info.st_size > _MAX_PROMPT_BYTES
@@ -351,7 +351,7 @@ def _install_shutdown_handlers(loop, stop: asyncio.Event) -> tuple[signal.Signal
     installed = []
     for signum in (signal.SIGINT, signal.SIGTERM):
         try:
-            loop.add_signal_handler(signum, stop.set)
+            loop.add_signal_handler(signum, stop.set)  # windows-footgun: ok — guarded
         except (NotImplementedError, RuntimeError):
             continue
         installed.append(signum)

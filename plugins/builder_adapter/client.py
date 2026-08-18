@@ -33,8 +33,8 @@ class OperatorKey:
 def load_operator_key(settings: RuntimeSettings, key_id: str | None = None) -> OperatorKey:
     """Select an active key authorized for the current local process."""
     auth = _read_owner_json(settings.auth_file, exact_mode=0o600)
-    uid = os.geteuid()
-    gid = os.getegid()
+    uid = os.geteuid()  # windows-footgun: ok — Unix peer credentials
+    gid = os.getegid()  # windows-footgun: ok — Unix peer credentials
     matches = []
     for item in auth.get("keys", []):
         if key_id is not None and item.get("key_id") != key_id:
@@ -222,4 +222,3 @@ class BuilderAdapterClient:
 
     def review_evidence_capsule(self, job_id: str) -> dict[str, Any]:
         return self.request("GET", f"/v1/review-jobs/{job_id}/evidence-capsule")
-
