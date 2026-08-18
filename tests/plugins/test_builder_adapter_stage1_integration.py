@@ -28,7 +28,7 @@ from tests.plugins.test_builder_adapter_schema import request_payload
 
 GOVERNANCE_REPOSITORY = Path("/opt/bots")
 APPROVED_GOVERNANCE_SNAPSHOT = (
-    "c7c06549bf51726c73d50f1fda6bd96843a19a1f"
+    "93ac9675b3edfee34b5769899b7726c542436460"
 )
 EXPECTED_TOOLS = tuple(sorted(BUILDER_WORKER_POLICY["tool_allowlist"]))
 
