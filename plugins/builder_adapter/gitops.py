@@ -6,6 +6,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import stat
 import subprocess
 from pathlib import Path, PurePosixPath
 
@@ -295,6 +296,170 @@ class GitVerifier:
 
     def manifest_from_artifact(self, raw: bytes) -> AllowedPathManifest:
         return AllowedPathManifest(json.loads(raw))
+
+    # -- review-orchestration snapshot observation ---------------------------
+    @staticmethod
+    def _read_regular_blob(root: Path, relpath: str) -> bytes:
+        """Read one regular file through no-follow directory descriptors."""
+        parts = PurePosixPath(relpath).parts
+        descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for component in parts[:-1]:
+                child = os.open(
+                    component,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=descriptor,
+                )
+                os.close(descriptor)
+                descriptor = child
+            file_fd = os.open(
+                parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=descriptor
+            )
+            try:
+                info = os.fstat(file_fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise AdapterError("MANIFEST_MISMATCH", f"unsafe file type: {relpath}")
+                chunks = []
+                while True:
+                    chunk = os.read(file_fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                return b"".join(chunks)
+            finally:
+                os.close(file_fd)
+        except OSError as exc:
+            raise AdapterError("MANIFEST_MISMATCH", f"unsafe file path: {relpath}") from exc
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def canonical_worktree_root(
+        worktree: str | Path, allowed_roots: frozenset[Path] = frozenset()
+    ) -> Path:
+        """Canonicalize a worktree path and constrain it to trusted roots.
+
+        Rejects NUL, traversal, non-absolute, non-canonical (symlink) aliases,
+        and paths outside the configured allowed repository roots.
+        """
+        raw = os.fspath(worktree)
+        if not raw or "\x00" in raw:
+            raise AdapterError("WORKTREE_MISMATCH", "worktree path is empty or NUL")
+        root = Path(raw)
+        if not root.is_absolute():
+            raise AdapterError("WORKTREE_MISMATCH", "worktree path must be absolute")
+        try:
+            real = root.resolve(strict=True)
+        except OSError as exc:
+            raise AdapterError("WORKTREE_MISMATCH", "worktree does not exist") from exc
+        if real != root or root.is_symlink():
+            raise AdapterError("WORKTREE_MISMATCH", "worktree path is not canonical")
+        if allowed_roots:
+            resolved_roots = frozenset(
+                candidate.resolve(strict=True) for candidate in allowed_roots
+            )
+            if not any(
+                real == root_resolved or root_resolved in real.parents
+                for root_resolved in resolved_roots
+            ):
+                raise AdapterError(
+                    "WORKTREE_MISMATCH", "worktree is outside allowed repository roots"
+                )
+        return real
+
+    def observe_review_snapshot(
+        self,
+        worktree: str | Path,
+        *,
+        repository_id: str,
+        branch: str,
+        starting_sha: str,
+        allowed_paths: list[str],
+        allowed_roots: frozenset[Path] = frozenset(),
+    ) -> dict:
+        """Server-observed, zero-write snapshot of the review worktree.
+
+        Independently reads the real worktree (remote, branch, HEAD, changed
+        paths and their content) rather than trusting caller-supplied strings.
+        The returned ``head``/``diff_hash``/``allowed_paths`` are the only
+        snapshot values bound into challenges and receipts.
+        """
+        root = self.canonical_worktree_root(worktree, allowed_roots)
+        expected_remote = self._allowlist.get(repository_id)
+        if expected_remote is None:
+            raise AdapterError("REPOSITORY_MISMATCH", "repository is not allowlisted")
+        remote = (
+            _run_git(root, "config", "--local", "--get", "remote.origin.url")
+            .stdout.decode()
+            .strip()
+        )
+        if remote != expected_remote:
+            raise AdapterError("REPOSITORY_MISMATCH", "canonical remote mismatch")
+        branch_ref = _run_git(root, "symbolic-ref", "-q", "HEAD").stdout.decode().strip()
+        if branch_ref.removeprefix("refs/heads/") != branch:
+            raise AdapterError("BRANCH_MISMATCH", "worktree branch mismatch")
+        head = _run_git(root, "rev-parse", "HEAD").stdout.decode().strip()
+        tracked = _run_git(
+            root,
+            "diff",
+            "--name-only",
+            "-z",
+            "--diff-filter=ACDMRTUXB",
+            starting_sha,
+        ).stdout
+        untracked = _run_git(
+            root, "ls-files", "--others", "--exclude-standard", "-z"
+        ).stdout
+        changed = sorted(
+            {
+                safe_relative_path(item.decode("utf-8"))
+                for item in (tracked + untracked).split(b"\0")
+                if item
+            }
+        )
+        allowed_matched = [
+            path
+            for path in changed
+            if any(fnmatch.fnmatchcase(path, pattern) for pattern in allowed_paths)
+        ]
+        forbidden = [path for path in changed if path not in allowed_matched]
+        if forbidden:
+            raise AdapterError(
+                "MANIFEST_MISMATCH", f"changed path outside allowed set: {forbidden[0]}"
+            )
+        diff_hash = self._review_diff_hash(root, allowed_matched)
+        return {
+            "head": head,
+            "diff_hash": diff_hash,
+            "allowed_paths": list(allowed_paths),
+            "changed_paths": allowed_matched,
+            "path_hashes": self._review_path_hashes(root, allowed_matched),
+        }
+
+    @classmethod
+    def _review_path_hashes(cls, root: Path, paths: list[str]) -> dict[str, str]:
+        """Per-path content digest for each allowed changed path."""
+        hashes: dict[str, str] = {}
+        for path in paths:
+            candidate = root / path
+            if candidate.exists() and not candidate.is_symlink():
+                hashes[path] = hashlib.sha256(
+                    cls._read_regular_blob(root, path)
+                ).hexdigest()
+            else:
+                hashes[path] = "<deleted>"
+        return hashes
+
+    @classmethod
+    def _review_diff_hash(cls, root: Path, paths: list[str]) -> str:
+        """Deterministic hash over each allowed changed path's current content."""
+        material = [
+            [path, digest]
+            for path, digest in sorted(cls._review_path_hashes(root, paths).items())
+        ]
+        return hashlib.sha256(
+            json.dumps(material, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
 
     def materialize_tree(self, repo: Path, commit: str, destination: Path) -> None:
         """Materialize blobs with plumbing only; never invoke checkout machinery."""

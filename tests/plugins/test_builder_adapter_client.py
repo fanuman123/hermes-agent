@@ -49,7 +49,7 @@ def test_start_builds_minimal_signed_intent():
     assert seen["headers"]["X-Hermes-Signature"] == expected
 
 
-def test_status_signs_path_without_query_string():
+def test_status_signs_full_path_including_query_string():
     seen = {}
 
     def transport(method, target, body, headers):
@@ -68,7 +68,7 @@ def test_status_signs_path_without_query_string():
         b"s" * 32,
         signed_material(
             "GET",
-            "/v1/dispatches/dispatch-1",
+            "/v1/dispatches/dispatch-1?cycle_id=CYCLE_ONE",
             "1234",
             seen["headers"]["X-Hermes-Nonce"],
             hashlib.sha256(b"").hexdigest(),

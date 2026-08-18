@@ -30,10 +30,11 @@ def _strict_json(body: bytes) -> dict:
 
 
 class BuilderAdapterService:
-    def __init__(self, adapter, authenticator, *, peer_resolver):
+    def __init__(self, adapter, authenticator, *, peer_resolver, orchestrator=None):
         self.adapter = adapter
         self.authenticator = authenticator
         self.peer_resolver = peer_resolver
+        self.orchestrator = orchestrator
 
     async def _principal(
         self, request: web.Request, body: bytes, *, canonical_payload: dict | None = None
@@ -45,7 +46,7 @@ class BuilderAdapterService:
         uid, gid = self.peer_resolver(sock)
         return self.authenticator.verify(
             method=request.method,
-            path=request.path,
+            path=request.path_qs,
             timestamp=request.headers.get("X-Hermes-Timestamp", ""),
             nonce=request.headers.get("X-Hermes-Nonce", ""),
             request_sha256=(
@@ -114,11 +115,133 @@ class BuilderAdapterService:
             error = AdapterError("INTERNAL_ERROR", "request failed closed")
             return web.json_response({"errors": [error.as_dict()]}, status=500)
 
+    def _require_orchestrator(self):
+        if self.orchestrator is None:
+            raise AdapterError(
+                "CAPABILITY_UNAVAILABLE", "review orchestrator is not configured"
+            )
+        return self.orchestrator
+
+    async def _review_operation(
+        self,
+        request: web.Request,
+        operation: str,
+        *,
+        job_id: str | None = None,
+        reads_body: bool = True,
+    ) -> web.Response:
+        body = await request.read() if reads_body else b""
+        try:
+            payload = _strict_json(body) if reads_body else None
+            principal = await self._principal(
+                request, body, canonical_payload=payload if reads_body else None
+            )
+            orchestrator = self._require_orchestrator()
+            if operation == "create":
+                result = orchestrator.create(principal, payload)
+            elif operation == "list":
+                result = orchestrator.list(
+                    principal,
+                    phase=request.query.get("phase"),
+                    status=request.query.get("status"),
+                )
+            elif operation == "get":
+                result = orchestrator.get(principal, job_id)
+            elif operation == "transition":
+                result = orchestrator.transition(principal, job_id, payload)
+            elif operation == "review":
+                result = orchestrator.record_review(principal, job_id, payload)
+            elif operation == "verification":
+                result = orchestrator.record_verification(principal, job_id, payload)
+            elif operation == "review_challenge":
+                result = orchestrator.review_challenge(principal, job_id)
+            elif operation == "verification_challenge":
+                result = orchestrator.verification_challenge(principal, job_id)
+            elif operation == "capsule":
+                result = orchestrator.evidence_capsule(principal, job_id)
+            else:  # pragma: no cover - internal dispatch
+                raise AdapterError("INTERNAL_ERROR", "unknown review operation")
+            return web.json_response(result)
+        except AdapterError as error:
+            return web.json_response({"errors": [error.as_dict()]}, status=400)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            error = AdapterError("INVALID_REQUEST", "malformed JSON body")
+            return web.json_response({"errors": [error.as_dict()]}, status=400)
+        except Exception:
+            error = AdapterError("INTERNAL_ERROR", "request failed closed")
+            return web.json_response({"errors": [error.as_dict()]}, status=500)
+
+    async def _review_create(self, request: web.Request) -> web.Response:
+        return await self._review_operation(request, "create")
+
+    async def _review_list(self, request: web.Request) -> web.Response:
+        return await self._review_operation(request, "list", reads_body=False)
+
+    async def _review_get(self, request: web.Request) -> web.Response:
+        return await self._review_operation(
+            request, "get", job_id=request.match_info["job_id"], reads_body=False
+        )
+
+    async def _review_transition(self, request: web.Request) -> web.Response:
+        return await self._review_operation(
+            request, "transition", job_id=request.match_info["job_id"]
+        )
+
+    async def _review_record_review(self, request: web.Request) -> web.Response:
+        return await self._review_operation(
+            request, "review", job_id=request.match_info["job_id"]
+        )
+
+    async def _review_record_verification(self, request: web.Request) -> web.Response:
+        return await self._review_operation(
+            request, "verification", job_id=request.match_info["job_id"]
+        )
+
+    async def _review_get_review_challenge(self, request: web.Request) -> web.Response:
+        return await self._review_operation(
+            request, "review_challenge", job_id=request.match_info["job_id"], reads_body=False
+        )
+
+    async def _review_get_verification_challenge(
+        self, request: web.Request
+    ) -> web.Response:
+        return await self._review_operation(
+            request, "verification_challenge", job_id=request.match_info["job_id"], reads_body=False
+        )
+
+    async def _review_evidence_capsule(self, request: web.Request) -> web.Response:
+        return await self._review_operation(
+            request, "capsule", job_id=request.match_info["job_id"], reads_body=False
+        )
+
     def application(self) -> web.Application:
         app = web.Application(client_max_size=1_000_000)
         app.router.add_post("/v1/dispatches", self.dispatch)
         app.router.add_get("/v1/dispatches/{dispatch_id}", self.status)
         app.router.add_post("/v1/dispatches/{dispatch_id}/cancel", self.cancel)
+
+        app.router.add_post("/v1/review-jobs", self._review_create)
+        app.router.add_get("/v1/review-jobs", self._review_list)
+        app.router.add_get("/v1/review-jobs/{job_id}", self._review_get)
+        app.router.add_post(
+            "/v1/review-jobs/{job_id}/transition", self._review_transition
+        )
+        app.router.add_post("/v1/review-jobs/{job_id}/review", self._review_record_review)
+        app.router.add_post(
+            "/v1/review-jobs/{job_id}/verification", self._review_record_verification
+        )
+        app.router.add_get(
+            "/v1/review-jobs/{job_id}/review-challenge",
+            self._review_get_review_challenge,
+        )
+        app.router.add_get(
+            "/v1/review-jobs/{job_id}/verification-challenge",
+            self._review_get_verification_challenge,
+        )
+        app.router.add_get(
+            "/v1/review-jobs/{job_id}/evidence-capsule", self._review_evidence_capsule
+        )
+
         async def health(_: web.Request) -> web.Response:
             return web.json_response(
                 {
