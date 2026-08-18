@@ -39,6 +39,7 @@ SCHEMA_PATHS = {
 
 @dataclass(frozen=True)
 class RuntimeSettings:
+    config_path: Path
     socket_path: Path
     state_path: Path
     auth_file: Path
@@ -52,8 +53,11 @@ class RuntimeSettings:
     validation_docker_host: str | None
     validation_image_id: str | None
     review_state_path: Path | None
+    review_receipt_key_path: Path | None
     repository_roots: list[str]
     codex_executable: str | None
+    codex_executable_sha256: str | None
+    codex_interpreter_sha256: str | None
     codex_version: str | None
     codex_identity: str | None
     codex_timeout_seconds: int | None
@@ -62,9 +66,8 @@ class RuntimeSettings:
     def from_file(cls, path: str | Path) -> "RuntimeSettings":
         value = _read_owner_json(Path(path), exact_mode=None)
         review_state_path = value.get("review_state_path")
-        if review_state_path is None:
-            review_state_path = str(Path(value["state_path"]).parent / "review_jobs.db")
         return cls(
+            config_path=Path(path).resolve(strict=True),
             socket_path=Path(value["socket_path"]),
             state_path=Path(value["state_path"]),
             auth_file=Path(value["auth_file"]),
@@ -77,9 +80,21 @@ class RuntimeSettings:
             validation_docker_binary=value.get("validation_docker_binary"),
             validation_docker_host=value.get("validation_docker_host"),
             validation_image_id=value.get("validation_image_id"),
-            review_state_path=Path(review_state_path),
+            # Review orchestration is explicitly opt-in.  Legacy runtime
+            # configurations that omit this field, and configurations that
+            # deliberately set it to null, retain the pre-review behavior.
+            review_state_path=(
+                Path(review_state_path) if review_state_path is not None else None
+            ),
+            review_receipt_key_path=(
+                Path(value["review_receipt_key_path"])
+                if value.get("review_receipt_key_path") is not None
+                else None
+            ),
             repository_roots=[str(item) for item in value.get("repository_roots", [])],
             codex_executable=value.get("codex_executable"),
+            codex_executable_sha256=value.get("codex_executable_sha256"),
+            codex_interpreter_sha256=value.get("codex_interpreter_sha256"),
             codex_version=value.get("codex_version"),
             codex_identity=value.get("codex_identity"),
             codex_timeout_seconds=value.get("codex_timeout_seconds"),
@@ -247,14 +262,28 @@ def _require_repository_roots(roots: list[str]) -> frozenset[Path]:
     return frozenset(resolved)
 
 
+def _require_codex_executable_sha256(value: str | None) -> str:
+    """Require a canonical, operator-pinned Codex executable identity."""
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise AdapterError(
+            "INVALID_CONFIG",
+            "review orchestration requires a lowercase Codex executable SHA-256",
+        )
+    return value
+
+
 def build_runtime(settings: RuntimeSettings):
     # Repository-root containment is a precondition for review orchestration.
     # Validate it before any governance/schema/store construction so an empty
     # or invalid root set fails closed deterministically, independent of
     # governance-commit or schema-validator availability.
     repository_roots = None
+    codex_executable_sha256 = None
     if settings.review_state_path is not None:
         repository_roots = _require_repository_roots(settings.repository_roots)
+        codex_executable_sha256 = _require_codex_executable_sha256(
+            settings.codex_executable_sha256
+        )
 
     snapshot = GovernanceSnapshot(settings.governance_repo, settings.governance_commit)
     validation_profile = snapshot.value("validation_profile")
@@ -303,9 +332,12 @@ def build_runtime(settings: RuntimeSettings):
         # Exactly one authority is shared by the orchestrator (which verifies)
         # and the runner/attestor (which mint).  Containment and the concrete
         # Codex backend are required; fail closed if they are not configured.
-        authority = ReceiptAuthority()
+        receipt_key_path = settings.review_receipt_key_path or Path(
+            f"{settings.review_state_path}.receipt-keys"
+        )
+        authority = ReceiptAuthority.from_key_directory(receipt_key_path)
         review_orchestrator = ReviewOrchestrator(
-            ReviewStore(settings.review_state_path),
+            ReviewStore(settings.review_state_path, authority=authority),
             git=git,
             authority=authority,
             repository_roots=repository_roots,
@@ -315,6 +347,15 @@ def build_runtime(settings: RuntimeSettings):
             version=settings.codex_version or "",
             identity=settings.codex_identity or "codex_mcp",
             timeout_seconds=settings.codex_timeout_seconds or 1800,
+            executable_sha256=codex_executable_sha256,
+            interpreter_sha256=settings.codex_interpreter_sha256,
+            protected_roots=[
+                settings.config_path.parent,
+                settings.state_path.parent,
+                settings.auth_file.parent,
+                settings.review_state_path.parent,
+                receipt_key_path,
+            ],
         )
         runner = ReviewRunner(git, authority, codex_backend)
         attestor = ValidationAttestor(
@@ -329,6 +370,7 @@ def build_runtime(settings: RuntimeSettings):
         auth,
         peer_resolver=darwin_peer_credentials,
         orchestrator=review_orchestrator,
+        review_routes_enabled=review_orchestrator is not None,
     )
     return service.application(), schema_temp, review_runtime
 

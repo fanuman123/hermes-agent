@@ -30,11 +30,20 @@ def _strict_json(body: bytes) -> dict:
 
 
 class BuilderAdapterService:
-    def __init__(self, adapter, authenticator, *, peer_resolver, orchestrator=None):
+    def __init__(
+        self,
+        adapter,
+        authenticator,
+        *,
+        peer_resolver,
+        orchestrator=None,
+        review_routes_enabled: bool = True,
+    ):
         self.adapter = adapter
         self.authenticator = authenticator
         self.peer_resolver = peer_resolver
         self.orchestrator = orchestrator
+        self.review_routes_enabled = review_routes_enabled
 
     async def _principal(
         self, request: web.Request, body: bytes, *, canonical_payload: dict | None = None
@@ -220,27 +229,32 @@ class BuilderAdapterService:
         app.router.add_get("/v1/dispatches/{dispatch_id}", self.status)
         app.router.add_post("/v1/dispatches/{dispatch_id}/cancel", self.cancel)
 
-        app.router.add_post("/v1/review-jobs", self._review_create)
-        app.router.add_get("/v1/review-jobs", self._review_list)
-        app.router.add_get("/v1/review-jobs/{job_id}", self._review_get)
-        app.router.add_post(
-            "/v1/review-jobs/{job_id}/transition", self._review_transition
-        )
-        app.router.add_post("/v1/review-jobs/{job_id}/review", self._review_record_review)
-        app.router.add_post(
-            "/v1/review-jobs/{job_id}/verification", self._review_record_verification
-        )
-        app.router.add_get(
-            "/v1/review-jobs/{job_id}/review-challenge",
-            self._review_get_review_challenge,
-        )
-        app.router.add_get(
-            "/v1/review-jobs/{job_id}/verification-challenge",
-            self._review_get_verification_challenge,
-        )
-        app.router.add_get(
-            "/v1/review-jobs/{job_id}/evidence-capsule", self._review_evidence_capsule
-        )
+        if self.review_routes_enabled:
+            app.router.add_post("/v1/review-jobs", self._review_create)
+            app.router.add_get("/v1/review-jobs", self._review_list)
+            app.router.add_get("/v1/review-jobs/{job_id}", self._review_get)
+            app.router.add_post(
+                "/v1/review-jobs/{job_id}/transition", self._review_transition
+            )
+            app.router.add_post(
+                "/v1/review-jobs/{job_id}/review", self._review_record_review
+            )
+            app.router.add_post(
+                "/v1/review-jobs/{job_id}/verification",
+                self._review_record_verification,
+            )
+            app.router.add_get(
+                "/v1/review-jobs/{job_id}/review-challenge",
+                self._review_get_review_challenge,
+            )
+            app.router.add_get(
+                "/v1/review-jobs/{job_id}/verification-challenge",
+                self._review_get_verification_challenge,
+            )
+            app.router.add_get(
+                "/v1/review-jobs/{job_id}/evidence-capsule",
+                self._review_evidence_capsule,
+            )
 
         async def health(_: web.Request) -> web.Response:
             return web.json_response(

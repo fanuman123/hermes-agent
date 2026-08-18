@@ -299,8 +299,85 @@ class GitVerifier:
 
     # -- review-orchestration snapshot observation ---------------------------
     @staticmethod
-    def _read_regular_blob(root: Path, relpath: str) -> bytes:
-        """Read one regular file through no-follow directory descriptors."""
+    def _verify_review_baseline(root: Path, starting_sha: str, head: str) -> str:
+        """Re-prove that the exact baseline commit exists beneath ``head``."""
+        try:
+            baseline = (
+                _run_git(root, "rev-parse", "--verify", f"{starting_sha}^{{commit}}")
+                .stdout.decode()
+                .strip()
+            )
+        except subprocess.CalledProcessError as exc:
+            raise AdapterError("HEAD_MISMATCH", "starting baseline commit does not exist") from exc
+        if baseline != starting_sha:
+            raise AdapterError("HEAD_MISMATCH", "starting baseline is not an exact commit id")
+        if _run_git(
+            root, "merge-base", "--is-ancestor", baseline, head, check=False
+        ).returncode:
+            raise AdapterError("HEAD_MISMATCH", "baseline is not an ancestor of branch HEAD")
+        return baseline
+
+    def observe_review_baseline(
+        self,
+        worktree: str | Path,
+        *,
+        repository_id: str,
+        branch: str,
+        starting_sha: str,
+        allowed_roots: frozenset[Path] = frozenset(),
+        require_allowlisted_remote: bool = True,
+    ) -> dict:
+        """Observe a clean attached branch HEAD as the server-side baseline."""
+        root = self.canonical_worktree_root(worktree, allowed_roots)
+        branch_ref = _run_git(root, "symbolic-ref", "-q", "HEAD").stdout.decode().strip()
+        observed_branch = branch_ref.removeprefix("refs/heads/")
+        if observed_branch != branch:
+            raise AdapterError("BRANCH_MISMATCH", "worktree branch mismatch")
+        remote = (
+            _run_git(root, "config", "--local", "--get", "remote.origin.url")
+            .stdout.decode()
+            .strip()
+        )
+        expected_remote = self._allowlist.get(repository_id)
+        if require_allowlisted_remote:
+            if expected_remote is None:
+                raise AdapterError("REPOSITORY_MISMATCH", "repository is not allowlisted")
+            if remote != expected_remote:
+                raise AdapterError("REPOSITORY_MISMATCH", "canonical remote mismatch")
+        status = _run_git(
+            root,
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ).stdout
+        if status:
+            raise AdapterError("WORKTREE_MISMATCH", "job creation requires a clean worktree")
+        head = _run_git(root, "rev-parse", "HEAD").stdout.decode().strip()
+        branch_head = _run_git(root, "rev-parse", f"refs/heads/{branch}").stdout.decode().strip()
+        if head != branch_head:
+            raise AdapterError("HEAD_MISMATCH", "HEAD is not the current branch tip")
+        baseline = self._verify_review_baseline(root, starting_sha, head)
+        evidence = {
+            "source": "server_verified_hermes_baseline_ancestor",
+            "repository_id": repository_id,
+            "canonical_remote": remote,
+            "branch": observed_branch,
+            "starting_sha": baseline,
+            "current_head": head,
+            "worktree_clean": True,
+        }
+        return {
+            **evidence,
+            "evidence_sha256": hashlib.sha256(
+                json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest(),
+        }
+
+    @staticmethod
+    def _read_regular_blob_state(root: Path, relpath: str) -> tuple[bytes, int]:
+        """Read one regular file and its mode through no-follow descriptors."""
         parts = PurePosixPath(relpath).parts
         descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
         try:
@@ -325,13 +402,18 @@ class GitVerifier:
                     if not chunk:
                         break
                     chunks.append(chunk)
-                return b"".join(chunks)
+                return b"".join(chunks), stat.S_IMODE(info.st_mode)
             finally:
                 os.close(file_fd)
         except OSError as exc:
             raise AdapterError("MANIFEST_MISMATCH", f"unsafe file path: {relpath}") from exc
         finally:
             os.close(descriptor)
+
+    @classmethod
+    def _read_regular_blob(cls, root: Path, relpath: str) -> bytes:
+        """Read one regular file through no-follow directory descriptors."""
+        return cls._read_regular_blob_state(root, relpath)[0]
 
     @staticmethod
     def canonical_worktree_root(
@@ -381,6 +463,10 @@ class GitVerifier:
 
         Independently reads the real worktree (remote, branch, HEAD, changed
         paths and their content) rather than trusting caller-supplied strings.
+        Review and validation consume a committed ``HEAD`` tree, so staged,
+        unstaged, and untracked content is rejected before a snapshot can be
+        issued.  This keeps the reviewed bytes identical to ``git archive
+        HEAD`` used by the Docker validation boundary.
         The returned ``head``/``diff_hash``/``allowed_paths`` are the only
         snapshot values bound into challenges and receipts.
         """
@@ -399,6 +485,20 @@ class GitVerifier:
         if branch_ref.removeprefix("refs/heads/") != branch:
             raise AdapterError("BRANCH_MISMATCH", "worktree branch mismatch")
         head = _run_git(root, "rev-parse", "HEAD").stdout.decode().strip()
+        self._verify_review_baseline(root, starting_sha, head)
+        status = _run_git(
+            root,
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ).stdout
+        if status:
+            raise AdapterError(
+                "WORKTREE_MISMATCH",
+                "review and validation require a clean committed HEAD",
+            )
         tracked = _run_git(
             root,
             "diff",
@@ -406,14 +506,12 @@ class GitVerifier:
             "-z",
             "--diff-filter=ACDMRTUXB",
             starting_sha,
-        ).stdout
-        untracked = _run_git(
-            root, "ls-files", "--others", "--exclude-standard", "-z"
+            head,
         ).stdout
         changed = sorted(
             {
                 safe_relative_path(item.decode("utf-8"))
-                for item in (tracked + untracked).split(b"\0")
+                for item in tracked.split(b"\0")
                 if item
             }
         )
@@ -427,36 +525,98 @@ class GitVerifier:
             raise AdapterError(
                 "MANIFEST_MISMATCH", f"changed path outside allowed set: {forbidden[0]}"
             )
-        diff_hash = self._review_diff_hash(root, allowed_matched)
+        path_hashes = self._review_head_path_hashes(root, head, allowed_matched)
+        diff_hash = self._review_diff_hash(path_hashes)
+        final_head = _run_git(root, "rev-parse", "HEAD").stdout.decode().strip()
+        self._verify_review_baseline(root, starting_sha, final_head)
+        if (
+            final_head != head
+            or _run_git(
+                root,
+                "status",
+                "--porcelain=v2",
+                "-z",
+                "--untracked-files=all",
+                "--ignore-submodules=none",
+            ).stdout
+        ):
+            raise AdapterError(
+                "WORKTREE_MISMATCH",
+                "worktree changed while the committed snapshot was observed",
+            )
         return {
             "head": head,
             "diff_hash": diff_hash,
             "allowed_paths": list(allowed_paths),
             "changed_paths": allowed_matched,
-            "path_hashes": self._review_path_hashes(root, allowed_matched),
+            "path_hashes": path_hashes,
+            "snapshot_source": "committed_head",
+            "worktree_clean": True,
         }
 
-    @classmethod
-    def _review_path_hashes(cls, root: Path, paths: list[str]) -> dict[str, str]:
-        """Per-path content digest for each allowed changed path."""
+    @staticmethod
+    def _review_head_path_hashes(
+        root: Path, head: str, paths: list[str]
+    ) -> dict[str, str]:
+        """Hash type, mode, and content from the exact committed HEAD tree."""
         hashes: dict[str, str] = {}
         for path in paths:
-            candidate = root / path
-            if candidate.exists() and not candidate.is_symlink():
-                hashes[path] = hashlib.sha256(
-                    cls._read_regular_blob(root, path)
-                ).hexdigest()
-            else:
+            raw = _run_git(root, "ls-tree", "-z", head, "--", path).stdout
+            entries = [entry for entry in raw.split(b"\0") if entry]
+            if not entries:
                 hashes[path] = "<deleted>"
+                continue
+            if len(entries) != 1:
+                raise AdapterError("MANIFEST_MISMATCH", f"ambiguous Git object: {path}")
+            metadata, raw_path = entries[0].split(b"\t", 1)
+            mode, kind, object_id = metadata.split(b" ", 2)
+            if raw_path.decode("utf-8") != path:
+                raise AdapterError("MANIFEST_MISMATCH", f"Git path mismatch: {path}")
+            if kind != b"blob" or mode not in {b"100644", b"100755"}:
+                raise AdapterError("MANIFEST_MISMATCH", f"unsafe file type: {path}")
+            content = _run_git(root, "cat-file", "blob", object_id.decode()).stdout
+            state = {
+                "type": "regular",
+                "mode": int(mode[-3:], 8),
+                "content_sha256": hashlib.sha256(content).hexdigest(),
+            }
+            hashes[path] = hashlib.sha256(
+                json.dumps(state, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
         return hashes
 
     @classmethod
-    def _review_diff_hash(cls, root: Path, paths: list[str]) -> str:
-        """Deterministic hash over each allowed changed path's current content."""
-        material = [
-            [path, digest]
-            for path, digest in sorted(cls._review_path_hashes(root, paths).items())
-        ]
+    def _review_path_hashes(cls, root: Path, paths: list[str]) -> dict[str, str]:
+        """Per-path digest binding regular-file content, type, and mode."""
+        hashes: dict[str, str] = {}
+        for path in paths:
+            candidate = root / path
+            try:
+                info = candidate.lstat()
+            except FileNotFoundError:
+                hashes[path] = "<deleted>"
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                raise AdapterError("MANIFEST_MISMATCH", f"unsafe file type: {path}")
+            content, mode = cls._read_regular_blob_state(root, path)
+            state = {
+                "type": "regular",
+                "mode": mode,
+                "content_sha256": hashlib.sha256(content).hexdigest(),
+            }
+            hashes[path] = hashlib.sha256(
+                json.dumps(state, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+        return hashes
+
+    @classmethod
+    def _review_diff_hash(cls, path_hashes: dict[str, str]) -> str:
+        """Bind the challenge digest to a clean, committed HEAD tree."""
+        material = {
+            "snapshot_source": "committed_head",
+            "worktree_clean": True,
+            "paths": [[path, digest] for path, digest in sorted(path_hashes.items())],
+        }
         return hashlib.sha256(
             json.dumps(material, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()

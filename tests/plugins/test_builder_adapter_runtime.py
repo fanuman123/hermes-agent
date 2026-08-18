@@ -31,6 +31,7 @@ from plugins.builder_adapter.validation import ValidationRunner
 REPOSITORY_ID = "hermes-agent"
 BRANCH = "feat/review"
 ALLOWED_PATHS = ["plugins/builder_adapter/**"]
+_DEFAULT_CODEX_DIGEST = object()
 
 
 def _run_git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -73,6 +74,8 @@ def make_git_worktree(tmp_path: Path) -> tuple[Path, str, str]:
     impl = worktree / "plugins/builder_adapter/impl.py"
     impl.parent.mkdir(parents=True, exist_ok=True)
     impl.write_text("value = 1\n")
+    _run_git("-C", str(worktree), "add", "plugins/builder_adapter/impl.py")
+    _run_git("-C", str(worktree), "commit", "-qm", "implementation")
     return worktree, starting_sha, str(source)
 
 
@@ -89,11 +92,16 @@ def create_payload(worktree: Path, starting_sha: str) -> dict:
 
 def make_codex_executable(tmp_path: Path) -> str:
     script = tmp_path / "codex-review"
+    interpreter = (
+        "/Library/Developer/CommandLineTools/usr/bin/python3"
+        if sys.platform == "darwin"
+        else sys.executable
+    )
     script.write_text(
-        f"#!{sys.executable}\n"
+        f"#!{interpreter}\n"
         "import json\n"
         "print(json.dumps({'thread_id': 'thread-1', 'response': 'ok', "
-        "'zero_write': True, 'findings': []}))\n",
+        "'findings': []}))\n",
         encoding="utf-8",
     )
     script.chmod(0o755)
@@ -123,7 +131,14 @@ class _FakeSnapshot:
         ).encode("utf-8")
 
 
-def _make_settings(tmp_path: Path, remote: str, *, roots=None, codex=None):
+def _make_settings(
+    tmp_path: Path,
+    remote: str,
+    *,
+    roots=None,
+    codex=None,
+    codex_sha256=_DEFAULT_CODEX_DIGEST,
+):
     profile_id = "hermes-builder-adapter-strict.v1"
     auth_file = tmp_path / "auth.json"
     auth_file.write_text(
@@ -142,6 +157,7 @@ def _make_settings(tmp_path: Path, remote: str, *, roots=None, codex=None):
         encoding="utf-8",
     )
     auth_file.chmod(0o600)
+    codex_executable = codex if codex is not None else make_codex_executable(tmp_path)
     config = {
         "socket_path": str(tmp_path / "adapter.sock"),
         "state_path": str(tmp_path / "dispatch.db"),
@@ -153,10 +169,22 @@ def _make_settings(tmp_path: Path, remote: str, *, roots=None, codex=None):
         "cycle_registry": {},
         "review_state_path": str(tmp_path / "review.db"),
         "repository_roots": roots if roots is not None else [str(tmp_path.resolve())],
-        "codex_executable": codex if codex is not None else make_codex_executable(tmp_path),
+        "codex_executable": codex_executable,
         "codex_version": "0.0.0-test",
         "codex_identity": "codex_mcp",
     }
+    if codex_sha256 is _DEFAULT_CODEX_DIGEST:
+        config["codex_executable_sha256"] = hashlib.sha256(
+            Path(codex_executable).read_bytes()
+        ).hexdigest()
+    elif codex_sha256 is not None:
+        config["codex_executable_sha256"] = codex_sha256
+    first_line = Path(codex_executable).read_text(encoding="utf-8").splitlines()[0]
+    if first_line.startswith("#!"):
+        interpreter = Path(first_line[2:].split()[0]).resolve()
+        config["codex_interpreter_sha256"] = hashlib.sha256(
+            interpreter.read_bytes()
+        ).hexdigest()
     config_path = tmp_path / "runtime.json"
     config_path.write_text(json.dumps(config), encoding="utf-8")
     config_path.chmod(0o600)
@@ -211,7 +239,125 @@ def test_build_runtime_fails_closed_without_roots(tmp_path, monkeypatch):
     assert raised.value.code == "INVALID_CONFIG"
 
 
+@pytest.mark.parametrize("review_state_value", [pytest.param("omitted"), pytest.param(None)])
+def test_build_runtime_legacy_config_keeps_review_disabled(
+    tmp_path, monkeypatch, review_state_value
+):
+    config_path = _write_minimal_config(tmp_path)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    if review_state_value != "omitted":
+        config["review_state_path"] = review_state_value
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    config_path.chmod(0o600)
+
+    auth_file = tmp_path / "auth.json"
+    auth_file.write_text(
+        json.dumps(
+            {
+                "keys": [
+                    {
+                        "principal": "orchestrator-mcp",
+                        "key_id": "runtime-test-key",
+                        "secret_env": "HERMES_BUILDER_ADAPTER_SECRET_RUNTIME",
+                        "allowed_uid": os.getuid(),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    auth_file.chmod(0o600)
+
+    settings = RuntimeSettings.from_file(config_path)
+    assert settings.review_state_path is None
+    assert settings.repository_roots == []
+    assert settings.codex_executable is None
+    assert settings.codex_executable_sha256 is None
+    assert settings.codex_interpreter_sha256 is None
+
+    monkeypatch.setattr(
+        "plugins.builder_adapter.runtime.GovernanceSnapshot",
+        lambda repo, commit: _FakeSnapshot(settings.validation_profile_id),
+    )
+    monkeypatch.setenv("HERMES_BUILDER_ADAPTER_SECRET_RUNTIME", "s" * 32)
+
+    app, schema_temp, review_runtime = build_runtime(settings)
+    try:
+        assert review_runtime is None
+        paths = {
+            item.resource.canonical
+            for item in app.router.routes()
+            if item.resource is not None
+        }
+        assert not any(path.startswith("/v1/review-jobs") for path in paths)
+    finally:
+        schema_temp.cleanup()
+
+
 # ── build_runtime end-to-end review dispatch ────────────────────────────────
+@pytest.mark.parametrize(
+    "codex_sha256",
+    [
+        pytest.param(None, id="missing"),
+        pytest.param("A" * 64, id="uppercase"),
+        pytest.param("0" * 63, id="wrong-length"),
+        pytest.param("g" * 64, id="non-hex"),
+        pytest.param(123, id="non-string"),
+    ],
+)
+def test_build_runtime_requires_canonical_codex_digest(
+    tmp_path, monkeypatch, codex_sha256
+):
+    _worktree, _starting_sha, remote = make_git_worktree(tmp_path)
+    profile_id, settings = _make_settings(
+        tmp_path, remote, codex_sha256=codex_sha256
+    )
+    monkeypatch.setattr(
+        "plugins.builder_adapter.runtime.GovernanceSnapshot",
+        lambda repo, commit: _FakeSnapshot(profile_id),
+    )
+    monkeypatch.setenv("HERMES_BUILDER_ADAPTER_SECRET_RUNTIME", "s" * 32)
+
+    with pytest.raises(AdapterError) as raised:
+        build_runtime(settings)
+    assert raised.value.code == "INVALID_CONFIG"
+
+
+def test_build_runtime_rejects_codex_digest_mismatch(tmp_path, monkeypatch):
+    _worktree, _starting_sha, remote = make_git_worktree(tmp_path)
+    profile_id, settings = _make_settings(tmp_path, remote, codex_sha256="0" * 64)
+    monkeypatch.setattr(
+        "plugins.builder_adapter.runtime.GovernanceSnapshot",
+        lambda repo, commit: _FakeSnapshot(profile_id),
+    )
+    monkeypatch.setenv("HERMES_BUILDER_ADAPTER_SECRET_RUNTIME", "s" * 32)
+
+    with pytest.raises(AdapterError) as raised:
+        build_runtime(settings)
+    assert raised.value.code == "CODEX_UNAVAILABLE"
+    assert "identity does not match" in str(raised.value)
+
+
+def test_build_runtime_preserves_expected_codex_digest(tmp_path, monkeypatch):
+    _worktree, _starting_sha, remote = make_git_worktree(tmp_path)
+    profile_id, settings = _make_settings(tmp_path, remote)
+    monkeypatch.setattr(
+        "plugins.builder_adapter.runtime.GovernanceSnapshot",
+        lambda repo, commit: _FakeSnapshot(profile_id),
+    )
+    monkeypatch.setenv("HERMES_BUILDER_ADAPTER_SECRET_RUNTIME", "s" * 32)
+
+    _app, schema_temp, review_runtime = build_runtime(settings)
+    try:
+        assert review_runtime is not None
+        assert (
+            review_runtime._runner.backend.executable_sha256
+            == settings.codex_executable_sha256
+        )
+    finally:
+        schema_temp.cleanup()
+
+
 def test_build_runtime_dispatches_mints_and_accepts_review(tmp_path, monkeypatch):
     worktree, starting_sha, remote = make_git_worktree(tmp_path)
     profile_id, settings = _make_settings(tmp_path, remote)

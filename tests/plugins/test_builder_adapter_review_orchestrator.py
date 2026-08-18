@@ -23,6 +23,7 @@ import hmac
 import json
 import sqlite3
 import subprocess
+import sys
 from pathlib import Path
 from uuid import uuid4
 
@@ -50,7 +51,7 @@ from plugins.builder_adapter.review_orchestrator import (
     SCHEMA_VERSION,
 )
 from plugins.builder_adapter.review_receipts import (
-    CodexReviewBackend,
+    CodexReviewBackend as _CodexReviewBackend,
     ReceiptAuthority,
     ReviewRunner,
     ValidationAttestor,
@@ -70,6 +71,22 @@ VALIDATION_SECRET = b"v" * 32
 REPOSITORY_ID = "hermes-agent"
 BRANCH = "feat/review"
 ALLOWED_PATHS = ["plugins/builder_adapter/**"]
+
+
+def _test_interpreter() -> Path:
+    return Path(
+        "/Library/Developer/CommandLineTools/usr/bin/python3"
+        if sys.platform == "darwin"
+        else sys.executable
+    ).resolve()
+
+
+def CodexReviewBackend(**kwargs):
+    """Construct the real backend with the fixture script interpreter pinned."""
+    kwargs.setdefault(
+        "interpreter_sha256", hashlib.sha256(_test_interpreter().read_bytes()).hexdigest()
+    )
+    return _CodexReviewBackend(**kwargs)
 
 
 # ── git worktree fixtures ───────────────────────────────────────────────────
@@ -116,6 +133,8 @@ def make_git_worktree(tmp_path: Path, *, change: bool = True) -> tuple[Path, str
         impl = worktree / "plugins/builder_adapter/impl.py"
         impl.parent.mkdir(parents=True, exist_ok=True)
         impl.write_text("value = 1\n")
+        _run_git("-C", str(worktree), "add", "plugins/builder_adapter/impl.py")
+        _run_git("-C", str(worktree), "commit", "-qm", "implementation")
     return worktree, starting_sha, str(source)
 
 
@@ -186,8 +205,8 @@ def drive_to_reviewing_with_prompt(
 def make_codex_executable(
     tmp_path: Path,
     *,
-    zero_write: bool = True,
     findings=None,
+    response: str = "review complete",
     write_then_restore: str | None = None,
     extra_fields: dict | None = None,
 ) -> str:
@@ -199,19 +218,16 @@ def make_codex_executable(
     restores (changing its metadata); ``extra_fields`` smuggles forbidden keys
     into the stdout payload.
     """
-    import sys as _sys
-
     script = tmp_path / "codex-review"
     payload = {
         "thread_id": "thread-1",
-        "response": "review complete",
-        "zero_write": zero_write,
+        "response": response,
         "findings": findings or [],
     }
     if extra_fields:
         payload.update(extra_fields)
     lines = [
-        f"#!{_sys.executable}",
+        f"#!{_test_interpreter()}",
         "import json, sys",
         "sys.stdin.read()",  # accept the review prompt the backend pipes in
         f"_payload = {payload!r}",
@@ -233,10 +249,10 @@ def make_codex_executable(
 
 
 def make_review_runner(
-    tmp_path: Path, git, authority: ReceiptAuthority, *, zero_write=True, **kwargs
+    tmp_path: Path, git, authority: ReceiptAuthority, **kwargs
 ) -> ReviewRunner:
     backend = CodexReviewBackend(
-        executable=make_codex_executable(tmp_path, zero_write=zero_write, **kwargs),
+        executable=make_codex_executable(tmp_path, **kwargs),
         version="0.0.0-test",
         identity="codex_mcp",
     )
@@ -587,6 +603,60 @@ def test_blocked_phase_can_resume_to_owned_phase(tmp_path):
     assert orch.get("hermes", payload["job_id"])["phase"] == PHASE_IMPLEMENTING
 
 
+def test_blocked_phase_can_always_fail_terminally_regardless_of_resume_target(tmp_path):
+    orch, _, _, worktree, starting_sha, _ = make_orchestrator(tmp_path)
+    payload = create_payload(worktree, starting_sha)
+    orch.create("hermes", payload)
+    orch.transition("hermes", payload["job_id"], {"target_phase": PHASE_IMPLEMENTING})
+    orch.transition(
+        "hermes",
+        payload["job_id"],
+        {"target_phase": PHASE_BLOCKED, "block_reason": "cannot continue"},
+    )
+
+    failed = orch.transition(
+        "hermes", payload["job_id"], {"target_phase": PHASE_FAILED}
+    )
+
+    assert failed["phase"] == PHASE_FAILED
+    assert failed["status"] == "FAILED"
+
+
+@pytest.mark.parametrize("challenge_kind", ["review", "verification"])
+def test_challenge_reproves_baseline_ancestry_after_branch_reset(
+    tmp_path, challenge_kind
+):
+    orch, _, authority, worktree, starting_sha, _ = make_orchestrator(tmp_path)
+    payload = create_payload(worktree, starting_sha)
+    orch.create("hermes", payload)
+    if challenge_kind == "review":
+        drive_to_reviewing(orch, payload["job_id"])
+    else:
+        drive_to_verifying(orch, authority, payload["job_id"])
+    tree = _run_git("-C", str(worktree), "rev-parse", "HEAD^{tree}").stdout.strip()
+    orphan = _run_git(
+        "-C",
+        str(worktree),
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit-tree",
+        tree,
+        "-m",
+        "unrelated root",
+    ).stdout.strip()
+    _run_git("-C", str(worktree), "reset", "--hard", orphan)
+
+    with pytest.raises(AdapterError) as raised:
+        if challenge_kind == "review":
+            orch.review_challenge("hermes", payload["job_id"])
+        else:
+            orch.verification_challenge("hermes", payload["job_id"])
+
+    assert raised.value.code == "HEAD_MISMATCH"
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Role enforcement
 # ═══════════════════════════════════════════════════════════════════════════
@@ -801,6 +871,15 @@ def test_evidence_capsule_is_deterministic_and_self_describing(tmp_path):
     assert capsule == again
     expected = {key: capsule[key] for key in capsule if key != "capsule_sha256"}
     assert capsule["capsule_sha256"] == canonical_sha256(expected)
+    assert capsule["store_security"] == {
+        "guarantee": "local_consistency_and_single_artifact_rollback_detection",
+        "detects": [
+            "database_only_rollback",
+            "anchor_only_rollback",
+            "missing_anchor",
+        ],
+        "excludes": "coordinated_rollback_of_database_anchor_and_signing_keys",
+    }
 
 
 def test_evidence_capsule_requires_no_full_transcript(tmp_path):
@@ -1040,7 +1119,9 @@ def test_review_challenge_is_snapshot_bound(tmp_path):
     assert challenge["worktree_path"] == str(worktree)
     assert challenge["branch"] == BRANCH
     assert challenge["starting_sha"] == starting_sha
-    assert challenge["current_head"] == starting_sha
+    committed_head = _run_git("-C", str(worktree), "rev-parse", "HEAD").stdout.strip()
+    assert challenge["current_head"] == committed_head
+    assert committed_head != starting_sha
     assert challenge["current_diff_hash"]
     assert challenge["allowed_paths"] == list(ALLOWED_PATHS)
     assert challenge["review_round"] == 1
@@ -1052,14 +1133,10 @@ def test_review_challenge_is_snapshot_bound(tmp_path):
 
 def test_review_challenge_expires(tmp_path):
     orch, store, authority, worktree, starting_sha, _ = make_orchestrator(tmp_path)
+    store.challenge_ttl_seconds = -1
     payload = create_payload(worktree, starting_sha)
     orch.create("hermes", payload)
     challenge = drive_to_reviewing(orch, payload["job_id"])
-    with sqlite3.connect(store.path) as conn:
-        conn.execute(
-            "UPDATE review_challenges SET expires_at=? WHERE challenge_id=?",
-            ("2000-01-01T00:00:00Z", challenge["challenge_id"]),
-        )
     receipt = build_review_receipt(authority, challenge)
     with pytest.raises(AdapterError) as raised:
         orch.record_review("codex_mcp", payload["job_id"], {"receipt": receipt})
@@ -1207,17 +1284,15 @@ def test_repository_mutation_detected_independently(tmp_path):
     # Mutate the worktree after the challenge snapshot was observed.
     (worktree / "plugins/builder_adapter/impl.py").write_text("value = 2\n")
 
-    # The runner boundary observes the CURRENT (mutated) snapshot through the
-    # repository boundary — independent of any caller-supplied string — so its
-    # receipt no longer matches the challenge bound at issuance.
+    # The runner boundary independently observes the current repository state
+    # and refuses to mint any receipt for mutable, uncommitted content.
     git = GitVerifier({REPOSITORY_ID: remote})
     runner = make_review_runner(
         tmp_path, git, ReceiptAuthority(review_runner_secret=REVIEW_SECRET)
     )
-    receipt = runner.run(challenge=challenge, prompt=prompt_text)
     with pytest.raises(AdapterError) as raised:
-        orch.record_review("codex_mcp", payload["job_id"], {"receipt": receipt})
-    assert raised.value.code == "CHALLENGE_MISMATCH"
+        runner.run(challenge=challenge, prompt=prompt_text)
+    assert raised.value.code == "WORKTREE_MISMATCH"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1345,6 +1420,34 @@ def test_real_validator_integration_receipt_succeeds(tmp_path):
     assert result["merge_ready"] is True
 
 
+def test_validator_runs_the_exact_committed_reviewed_head(tmp_path):
+    orch, _, authority, worktree, starting_sha, remote = make_orchestrator(tmp_path)
+    payload = create_payload(worktree, starting_sha)
+    orch.create("hermes", payload)
+    verification_challenge = drive_to_verifying(orch, authority, payload["job_id"])
+
+    class RecordingValidation(FakeValidation):
+        expected_sha = None
+
+        def run(self, profile_id, worktree, expected_sha):
+            self.expected_sha = expected_sha
+            return super().run(profile_id, worktree, expected_sha)
+
+    validation = RecordingValidation()
+    attestor = ValidationAttestor(
+        GitVerifier({REPOSITORY_ID: remote}),
+        ReceiptAuthority(validation_runner_secret=VALIDATION_SECRET),
+        validation,
+        PROFILES,
+    )
+    receipt = attestor.run(challenge=verification_challenge, profile_id="profile")
+    committed_head = _run_git("-C", str(worktree), "rev-parse", "HEAD").stdout.strip()
+
+    assert validation.expected_sha == committed_head
+    assert receipt["snapshot_sha"] == committed_head
+    assert verification_challenge["current_head"] == committed_head
+
+
 def test_bad_evidence_digest_rejected(tmp_path):
     orch, _, authority, worktree, starting_sha, _ = make_orchestrator(tmp_path)
     payload = create_payload(worktree, starting_sha)
@@ -1440,6 +1543,94 @@ def test_exact_operation_retry_succeeds_after_consumption(tmp_path):
     assert second["verification_evidence"]["receipt_id"] == receipt["receipt_id"]
 
 
+def test_exact_ordinary_transition_retry_precedes_terminal_legality_checks(tmp_path):
+    orch, _, _, worktree, starting_sha, _ = make_orchestrator(tmp_path)
+    payload = create_payload(worktree, starting_sha)
+    orch.create("hermes", payload)
+    request = {"target_phase": PHASE_FAILED, "op_id": "op-terminal-retry"}
+
+    first = orch.transition("hermes", payload["job_id"], request)
+    second = orch.transition("hermes", payload["job_id"], request)
+
+    assert second == first
+    assert second["phase"] == PHASE_FAILED
+
+
+def test_conflicting_ordinary_transition_reuse_fails_before_terminal_check(tmp_path):
+    orch, _, _, worktree, starting_sha, _ = make_orchestrator(tmp_path)
+    payload = create_payload(worktree, starting_sha)
+    orch.create("hermes", payload)
+    orch.transition(
+        "hermes",
+        payload["job_id"],
+        {"target_phase": PHASE_FAILED, "op_id": "op-terminal-conflict"},
+    )
+
+    with pytest.raises(AdapterError) as raised:
+        orch.transition(
+            "hermes",
+            payload["job_id"],
+            {"target_phase": PHASE_IMPLEMENTING, "op_id": "op-terminal-conflict"},
+        )
+    assert raised.value.code == "IDEMPOTENCY_CONFLICT"
+
+
+def test_operation_result_tampering_fails_closed_on_replay(tmp_path):
+    orch, store, _, worktree, starting_sha, _ = make_orchestrator(tmp_path)
+    payload = create_payload(worktree, starting_sha)
+    orch.create("hermes", payload)
+    request = {"target_phase": PHASE_IMPLEMENTING, "op_id": "op-tamper"}
+    orch.transition("hermes", payload["job_id"], request)
+    with sqlite3.connect(store.path) as conn:
+        conn.execute(
+            "UPDATE review_operations SET result_json=? WHERE op_id=?",
+            ('{"job_id":"tampered"}', "op-tamper"),
+        )
+
+    with pytest.raises(AdapterError) as raised:
+        orch.transition("hermes", payload["job_id"], request)
+    assert raised.value.code == "AUDIT_ROLLBACK"
+
+
+def test_operation_revision_tampering_fails_closed_on_load(tmp_path):
+    orch, store, _, worktree, starting_sha, _ = make_orchestrator(tmp_path)
+    payload = create_payload(worktree, starting_sha)
+    orch.create("hermes", payload)
+    orch.transition(
+        "hermes",
+        payload["job_id"],
+        {"target_phase": PHASE_IMPLEMENTING, "op_id": "op-revision-tamper"},
+    )
+    with sqlite3.connect(store.path) as conn:
+        conn.execute(
+            "UPDATE review_operations SET revision=revision+1 WHERE op_id=?",
+            ("op-revision-tamper",),
+        )
+
+    with pytest.raises(AdapterError) as raised:
+        orch.get("hermes", payload["job_id"])
+    assert raised.value.code == "AUDIT_ROLLBACK"
+
+
+def test_operation_deletion_is_detected_by_audit_binding(tmp_path):
+    orch, store, _, worktree, starting_sha, _ = make_orchestrator(tmp_path)
+    payload = create_payload(worktree, starting_sha)
+    orch.create("hermes", payload)
+    orch.transition(
+        "hermes",
+        payload["job_id"],
+        {"target_phase": PHASE_IMPLEMENTING, "op_id": "op-delete-tamper"},
+    )
+    with sqlite3.connect(store.path) as conn:
+        conn.execute(
+            "DELETE FROM review_operations WHERE op_id=?", ("op-delete-tamper",)
+        )
+
+    with pytest.raises(AdapterError) as raised:
+        orch.get("hermes", payload["job_id"])
+    assert raised.value.code == "AUDIT_ROLLBACK"
+
+
 def test_cross_job_op_id_reuse_rejected(tmp_path):
     orch, _, _, worktree, starting_sha, _ = make_orchestrator(tmp_path)
     first = create_payload(worktree, starting_sha)
@@ -1507,7 +1698,7 @@ def test_audit_chain_tampering_is_detected(tmp_path):
         )
     with pytest.raises(AdapterError) as raised:
         orch.get("hermes", payload["job_id"])
-    assert raised.value.code == "AUDIT_INTEGRITY"
+    assert raised.value.code == "AUDIT_ROLLBACK"
 
 
 def test_audit_previous_hash_linkage_tampering_is_detected(tmp_path):
@@ -1522,7 +1713,7 @@ def test_audit_previous_hash_linkage_tampering_is_detected(tmp_path):
         )
     with pytest.raises(AdapterError) as raised:
         orch.get("hermes", payload["job_id"])
-    assert raised.value.code == "AUDIT_INTEGRITY"
+    assert raised.value.code == "AUDIT_ROLLBACK"
 
 
 def test_challenge_tamper_between_load_and_mutation_detected(tmp_path):
@@ -1539,7 +1730,7 @@ def test_challenge_tamper_between_load_and_mutation_detected(tmp_path):
     receipt = build_review_receipt(authority, challenge)
     with pytest.raises(AdapterError) as raised:
         orch.record_review("codex_mcp", payload["job_id"], {"receipt": receipt})
-    assert raised.value.code == "CHALLENGE_INTEGRITY"
+    assert raised.value.code == "AUDIT_ROLLBACK"
 
 
 def test_deleted_receipt_audit_event_detected(tmp_path):
@@ -1559,7 +1750,7 @@ def test_deleted_receipt_audit_event_detected(tmp_path):
         )
     with pytest.raises(AdapterError) as raised:
         orch.get("hermes", payload["job_id"])
-    assert raised.value.code == "AUDIT_INTEGRITY"
+    assert raised.value.code == "AUDIT_ROLLBACK"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1579,7 +1770,69 @@ def test_snapshot_drift_after_ready_rejects_complete(tmp_path):
 
     with pytest.raises(AdapterError) as raised:
         orch.transition("hermes", payload["job_id"], {"target_phase": PHASE_COMPLETE})
-    assert raised.value.code == "SNAPSHOT_STALE"
+    assert raised.value.code == "WORKTREE_MISMATCH"
+
+
+def test_dirty_allowed_content_cannot_receive_a_review_challenge(tmp_path):
+    orch, _, _, worktree, starting_sha, _ = make_orchestrator(tmp_path)
+    payload = create_payload(worktree, starting_sha)
+    orch.create("hermes", payload)
+    orch.transition("hermes", payload["job_id"], {"target_phase": PHASE_IMPLEMENTING})
+    (worktree / "plugins/builder_adapter/impl.py").write_text("value = 99\n")
+
+    with pytest.raises(AdapterError) as raised:
+        orch.transition(
+            "hermes",
+            payload["job_id"],
+            {"target_phase": PHASE_REVIEWING, "prompt_sha256": PROMPT},
+        )
+
+    assert raised.value.code == "WORKTREE_MISMATCH"
+    assert orch.get("hermes", payload["job_id"])["phase"] == PHASE_IMPLEMENTING
+
+
+def test_review_snapshot_hash_detects_chmod_only_drift(tmp_path):
+    worktree, starting_sha, remote = make_git_worktree(tmp_path)
+    verifier = GitVerifier({REPOSITORY_ID: remote})
+    kwargs = {
+        "repository_id": REPOSITORY_ID,
+        "branch": BRANCH,
+        "starting_sha": starting_sha,
+        "allowed_paths": list(ALLOWED_PATHS),
+        "allowed_roots": frozenset({tmp_path.resolve()}),
+    }
+    before = verifier.observe_review_snapshot(worktree, **kwargs)
+    changed = worktree / "plugins/builder_adapter/impl.py"
+    changed.chmod(0o755)
+    _run_git("-C", str(worktree), "add", "plugins/builder_adapter/impl.py")
+    _run_git("-C", str(worktree), "commit", "-qm", "change executable mode")
+    after = verifier.observe_review_snapshot(worktree, **kwargs)
+
+    assert after["diff_hash"] != before["diff_hash"]
+    assert after["path_hashes"]["plugins/builder_adapter/impl.py"] != before[
+        "path_hashes"
+    ]["plugins/builder_adapter/impl.py"]
+
+
+def test_review_snapshot_rejects_dangling_symlink_as_unsafe_type(tmp_path):
+    worktree, starting_sha, remote = make_git_worktree(tmp_path, change=False)
+    link = worktree / "plugins/builder_adapter/link.py"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to("missing-target.py")
+    _run_git("-C", str(worktree), "add", "plugins/builder_adapter/link.py")
+    _run_git("-C", str(worktree), "commit", "-qm", "add unsafe symlink")
+    verifier = GitVerifier({REPOSITORY_ID: remote})
+
+    with pytest.raises(AdapterError) as raised:
+        verifier.observe_review_snapshot(
+            worktree,
+            repository_id=REPOSITORY_ID,
+            branch=BRANCH,
+            starting_sha=starting_sha,
+            allowed_paths=list(ALLOWED_PATHS),
+            allowed_roots=frozenset({tmp_path.resolve()}),
+        )
+    assert raised.value.code == "MANIFEST_MISMATCH"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1590,6 +1843,86 @@ def test_path_traversal_and_nul_rejected(tmp_path):
     with pytest.raises(AdapterError) as raised:
         orch.create("hermes", create_payload(worktree, starting_sha, worktree_path=str(worktree) + "\x00evil"))
     assert raised.value.code == "INVALID_REQUEST"
+
+
+def _make_clean_baseline_orchestrator(tmp_path):
+    worktree, starting_sha, remote = make_git_worktree(tmp_path, change=False)
+    authority = ReceiptAuthority(
+        review_runner_secret=REVIEW_SECRET,
+        validation_runner_secret=VALIDATION_SECRET,
+        capsule_checkpoint_secret=b"c" * 32,
+    )
+    store = ReviewStore(tmp_path / "review.db", authority=authority)
+    orch = ReviewOrchestrator(
+        store,
+        git=GitVerifier({REPOSITORY_ID: remote}),
+        authority=authority,
+        repository_roots=[tmp_path.resolve()],
+    )
+    return orch, store, authority, worktree, starting_sha
+
+
+def test_create_binds_server_observed_clean_branch_head(tmp_path):
+    orch, _, _, worktree, starting_sha = _make_clean_baseline_orchestrator(tmp_path)
+    result = orch.create("hermes", create_payload(worktree, starting_sha))
+
+    assert result["starting_sha"] == starting_sha
+    assert result["current_head"] == starting_sha
+    assert result["baseline_evidence"]["starting_sha"] == starting_sha
+    assert result["baseline_evidence"]["current_head"] == starting_sha
+    assert result["baseline_evidence"]["source"] == "server_verified_hermes_baseline_ancestor"
+
+
+def test_create_verifies_caller_baseline_is_ancestor_of_current_head(tmp_path):
+    worktree, starting_sha, remote = make_git_worktree(tmp_path, change=True)
+    authority = ReceiptAuthority(capsule_checkpoint_secret=b"c" * 32)
+    orch = ReviewOrchestrator(
+        ReviewStore(tmp_path / "review.db", authority=authority),
+        git=GitVerifier({REPOSITORY_ID: remote}),
+        authority=authority,
+        repository_roots=[tmp_path.resolve()],
+    )
+
+    result = orch.create("hermes", create_payload(worktree, starting_sha))
+    assert result["starting_sha"] == starting_sha
+    assert result["baseline_evidence"]["starting_sha"] == starting_sha
+    assert result["baseline_evidence"]["current_head"] != starting_sha
+
+
+def test_signed_anchor_detects_offline_database_rewrite(tmp_path):
+    orch, store, _, worktree, starting_sha = _make_clean_baseline_orchestrator(tmp_path)
+    payload = create_payload(worktree, starting_sha)
+    orch.create("hermes", payload)
+    with sqlite3.connect(store.path) as conn:
+        conn.execute(
+            "UPDATE review_jobs SET status='FAILED' WHERE job_id=?", (payload["job_id"],)
+        )
+
+    with pytest.raises(AdapterError) as raised:
+        orch.get("hermes", payload["job_id"])
+
+    assert raised.value.code == "AUDIT_ROLLBACK"
+
+
+def test_record_review_replay_returns_original_verification_challenge(tmp_path):
+    orch, _, authority, worktree, starting_sha = _make_clean_baseline_orchestrator(tmp_path)
+    payload = create_payload(worktree, starting_sha)
+    orch.create("hermes", payload)
+    implementation = worktree / "plugins/builder_adapter/impl.py"
+    implementation.parent.mkdir(parents=True, exist_ok=True)
+    implementation.write_text("value = 1\n")
+    _run_git("-C", str(worktree), "add", "plugins/builder_adapter/impl.py")
+    _run_git("-C", str(worktree), "commit", "-qm", "implementation")
+    challenge = drive_to_reviewing(orch, payload["job_id"])
+    submission = {
+        "op_id": str(uuid4()),
+        "receipt": build_review_receipt(authority, challenge),
+    }
+
+    first = orch.record_review("codex_mcp", payload["job_id"], submission)
+    replay = orch.record_review("codex_mcp", payload["job_id"], submission)
+
+    assert replay["verification_challenge"] == first["verification_challenge"]
     with pytest.raises(AdapterError) as raised:
         orch.create("hermes", create_payload(worktree, starting_sha, worktree_path=str(worktree / ".." / ".." / "etc")))
     assert raised.value.code == "INVALID_REQUEST"
@@ -1708,6 +2041,7 @@ def _create_prior_schema(path: Path) -> None:
     )
     conn.commit()
     conn.close()
+    path.chmod(0o600)
 
 
 def test_prior_schema_migrates_transactionally(tmp_path):
@@ -1723,16 +2057,52 @@ def test_prior_schema_migrates_transactionally(tmp_path):
         challenge_cols = {r["name"] for r in conn.execute("PRAGMA table_info(review_challenges)")}
         assert {"round", "prompt_sha256", "revoked_at", "superseded_by"} <= challenge_cols
         op_cols = {r["name"] for r in conn.execute("PRAGMA table_info(review_operations)")}
-        assert "principal" in op_cols
+        assert {"principal", "result_sha256", "operation_sha256"} <= op_cols
 
     # A fresh job works on the migrated schema.
-    authority = ReceiptAuthority(
-        review_runner_secret=REVIEW_SECRET, validation_runner_secret=VALIDATION_SECRET
-    )
-    orch = ReviewOrchestrator(store, authority=authority)
+    # An unanchored legacy database may migrate for compatibility, but it may
+    # not acquire a new checkpoint authority after initialization.  Exercise
+    # the migrated schema without weakening that fail-closed boundary.
+    orch = ReviewOrchestrator(store)
     payload = create_payload(worktree, starting_sha)
     orch.create("hermes", payload)
     assert orch.get("hermes", payload["job_id"])["phase"] == "QUEUED"
+
+
+def test_previous_schema_operation_binding_migrates_transactionally(tmp_path):
+    db = tmp_path / "review.db"
+    ReviewStore(db)
+    with sqlite3.connect(db) as conn:
+        conn.executescript(
+            """
+            ALTER TABLE review_operations RENAME TO review_operations_v12;
+            CREATE TABLE review_operations (
+                op_id TEXT PRIMARY KEY,
+                principal TEXT NOT NULL,
+                job_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                payload_sha256 TEXT NOT NULL,
+                result_json TEXT,
+                revision INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                CHECK(length(payload_sha256) = 64)
+            );
+            DROP TABLE review_operations_v12;
+            UPDATE review_meta SET value='1.1.0' WHERE key='schema_version';
+            """
+        )
+
+    migrated = ReviewStore(db)
+    with sqlite3.connect(migrated.path) as conn:
+        conn.row_factory = sqlite3.Row
+        assert conn.execute(
+            "SELECT value FROM review_meta WHERE key='schema_version'"
+        ).fetchone()[0] == SCHEMA_VERSION
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(review_operations)")
+        }
+        assert {"result_sha256", "operation_sha256"} <= columns
 
 
 def test_unsupported_schema_fails_closed(tmp_path):
@@ -1742,6 +2112,7 @@ def test_unsupported_schema_fails_closed(tmp_path):
     conn.execute("INSERT INTO review_meta(key, value) VALUES ('schema_version', '9.9.9')")
     conn.commit()
     conn.close()
+    db.chmod(0o600)
     with pytest.raises(AdapterError) as raised:
         ReviewStore(db)
     assert raised.value.code == "UNSUPPORTED_SCHEMA"
@@ -1824,8 +2195,7 @@ def test_write_and_restore_fails_closed(tmp_path):
     prompt_text = "review this change"
     challenge = drive_to_reviewing_with_prompt(orch, payload["job_id"], prompt_text)
 
-    # The boundary writes the monitored path and restores it, then lies with
-    # zero_write=true; the backend's ctime monitor detects the write.
+    # The child makes no zero-write claim; the parent snapshot detects it.
     backend = CodexReviewBackend(
         executable=make_codex_executable(
             tmp_path, write_then_restore="plugins/builder_adapter/impl.py"
@@ -1843,7 +2213,7 @@ def test_write_and_restore_fails_closed(tmp_path):
     assert raised.value.code == "ZERO_WRITE_UNPROVEN"
 
 
-def test_missing_zero_write_attestation_fails_closed(tmp_path):
+def test_child_zero_write_claim_is_not_trusted(tmp_path):
     orch, _, authority, worktree, starting_sha, remote = make_orchestrator(tmp_path)
     payload = create_payload(worktree, starting_sha)
     orch.create("hermes", payload)
@@ -1851,7 +2221,7 @@ def test_missing_zero_write_attestation_fails_closed(tmp_path):
     challenge = drive_to_reviewing_with_prompt(orch, payload["job_id"], prompt_text)
 
     backend = CodexReviewBackend(
-        executable=make_codex_executable(tmp_path, zero_write=False),
+        executable=make_codex_executable(tmp_path, extra_fields={"zero_write": True}),
         version="0.0.0-test",
         identity="codex_mcp",
     )
@@ -1865,6 +2235,120 @@ def test_missing_zero_write_attestation_fails_closed(tmp_path):
     assert raised.value.code == "ZERO_WRITE_UNPROVEN"
 
 
+def test_git_metadata_access_is_os_denied_without_mutation(tmp_path):
+    orch, _, _, worktree, starting_sha, remote = make_orchestrator(tmp_path)
+    gitdir_marker = (worktree / ".git").read_text(encoding="utf-8").strip()
+    gitdir = ((worktree / ".git").parent / gitdir_marker[8:]).resolve()
+    protected_head = gitdir / "HEAD"
+    before_bytes = protected_head.read_bytes()
+    before_stat = protected_head.stat()
+    payload = create_payload(worktree, starting_sha)
+    orch.create("hermes", payload)
+    prompt_text = "review this change"
+    challenge = drive_to_reviewing_with_prompt(orch, payload["job_id"], prompt_text)
+    backend = CodexReviewBackend(
+        executable=make_codex_executable(
+            tmp_path, write_then_restore=str(protected_head)
+        ),
+        version="0.0.0-test",
+        identity="codex_mcp",
+    )
+    runner = ReviewRunner(
+        GitVerifier({REPOSITORY_ID: remote}),
+        ReceiptAuthority(review_runner_secret=REVIEW_SECRET),
+        backend,
+    )
+    receipt = runner.run(challenge=challenge, prompt=prompt_text)
+    after_stat = protected_head.stat()
+    assert receipt["modified_files"] == 0
+    assert protected_head.read_bytes() == before_bytes
+    assert (after_stat.st_mtime_ns, after_stat.st_ctime_ns) == (
+        before_stat.st_mtime_ns,
+        before_stat.st_ctime_ns,
+    )
+
+
+def test_review_output_is_redacted_before_signing(tmp_path):
+    orch, _, authority, worktree, starting_sha, remote = make_orchestrator(tmp_path)
+    payload = create_payload(worktree, starting_sha)
+    orch.create("hermes", payload)
+    prompt_text = "review this change"
+    challenge = drive_to_reviewing_with_prompt(orch, payload["job_id"], prompt_text)
+    secret = "super-secret-value"
+    runner = ReviewRunner(
+        GitVerifier({REPOSITORY_ID: remote}),
+        authority,
+        CodexReviewBackend(
+            executable=make_codex_executable(
+                tmp_path,
+                response=f"Authorization: Bearer {secret}",
+                findings=[
+                    {
+                        "severity": "MAJOR",
+                        "title": f"token={secret}",
+                        "path": f"reports/token={secret}.txt",
+                        "detail": f"--api-key {secret}",
+                    }
+                ],
+            ),
+            version="0.0.0-test",
+            identity="codex_mcp",
+        ),
+    )
+    receipt = runner.run(challenge=challenge, prompt=prompt_text)
+    serialized = json.dumps(receipt)
+    assert secret not in serialized
+    assert receipt["findings"][0]["title"] == "token=[REDACTED]"
+    assert receipt["findings"][0]["path"] == "reports/token=[REDACTED]"
+    assert receipt["findings"][0]["detail"] == "--api-key [REDACTED]"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"response": "x" * (64 * 1024 + 1)},
+        {
+            "findings": [
+                {"severity": "MINOR", "title": f"finding-{index}"}
+                for index in range(51)
+            ]
+        },
+        {
+            "findings": [
+                {
+                    "severity": "MINOR",
+                    "title": f"finding-{index}",
+                    "detail": "x" * 3000,
+                }
+                for index in range(50)
+            ]
+        },
+        {
+            "findings": [
+                {"severity": "MAJOR", "title": "bad path", "path": "../secret"}
+            ]
+        },
+    ],
+)
+def test_unbounded_or_unsafe_review_output_fails_closed(tmp_path, kwargs):
+    orch, _, _, worktree, starting_sha, remote = make_orchestrator(tmp_path)
+    payload = create_payload(worktree, starting_sha)
+    orch.create("hermes", payload)
+    prompt_text = "review this change"
+    challenge = drive_to_reviewing_with_prompt(orch, payload["job_id"], prompt_text)
+    runner = ReviewRunner(
+        GitVerifier({REPOSITORY_ID: remote}),
+        ReceiptAuthority(review_runner_secret=REVIEW_SECRET),
+        CodexReviewBackend(
+            executable=make_codex_executable(tmp_path, **kwargs),
+            version="0.0.0-test",
+            identity="codex_mcp",
+        ),
+    )
+    with pytest.raises(AdapterError):
+        runner.run(challenge=challenge, prompt=prompt_text)
+
+
 def test_concrete_backend_nonzero_exit_fails_closed(tmp_path):
     orch, _, authority, worktree, starting_sha, remote = make_orchestrator(tmp_path)
     payload = create_payload(worktree, starting_sha)
@@ -1873,7 +2357,7 @@ def test_concrete_backend_nonzero_exit_fails_closed(tmp_path):
     challenge = drive_to_reviewing_with_prompt(orch, payload["job_id"], prompt_text)
 
     script = tmp_path / "codex-fails"
-    script.write_text(f"#!{__import__('sys').executable}\nimport sys\nsys.exit(7)\n")
+    script.write_text(f"#!{_test_interpreter()}\nimport sys\nsys.exit(7)\n")
     script.chmod(0o755)
     backend = CodexReviewBackend(
         executable=str(script), version="0.0.0-test", identity="codex_mcp"
@@ -1923,7 +2407,7 @@ def test_tamper_then_exact_retry_fails_closed(tmp_path):
         orch.transition(
             "hermes", job_id, {"target_phase": PHASE_IMPLEMENTING, "op_id": "op-1"}
         )
-    assert raised.value.code == "RECORD_INTEGRITY"
+    assert raised.value.code == "AUDIT_ROLLBACK"
 
 
 def test_record_review_tamper_then_exact_retry_fails_closed(tmp_path):
@@ -1945,7 +2429,7 @@ def test_record_review_tamper_then_exact_retry_fails_closed(tmp_path):
         )
     with pytest.raises(AdapterError) as raised:
         orch.record_review("codex_mcp", job_id, request)
-    assert raised.value.code == "RECORD_INTEGRITY"
+    assert raised.value.code == "AUDIT_ROLLBACK"
 
 
 def test_record_verification_tamper_then_exact_retry_fails_closed(tmp_path):
@@ -1966,7 +2450,7 @@ def test_record_verification_tamper_then_exact_retry_fails_closed(tmp_path):
         )
     with pytest.raises(AdapterError) as raised:
         orch.record_verification("hermes", job_id, request)
-    assert raised.value.code == "RECORD_INTEGRITY"
+    assert raised.value.code == "AUDIT_ROLLBACK"
 
 
 def test_record_review_clean_exact_retry_succeeds(tmp_path):
@@ -2010,7 +2494,7 @@ def test_issue_challenge_on_tampered_state_fails_closed(tmp_path):
     }
     with pytest.raises(AdapterError) as raised:
         store.issue_challenge(challenge)
-    assert raised.value.code == "RECORD_INTEGRITY"
+    assert raised.value.code == "AUDIT_ROLLBACK"
 
 
 def test_get_single_connection_verified_read(tmp_path, monkeypatch):
@@ -2159,7 +2643,7 @@ def _populate_prior_store(db: Path, worktree: Path, starting_sha: str) -> str:
         conn.execute(
             "INSERT INTO review_jobs(job_id,request_sha256,owner_principal,phase,"
             "status,revision,created_at,updated_at,record_json,record_sha256) "
-            "VALUES (?,?,?,?,?,0,?,?,?,?)",
+            "VALUES (?,?,?,?,?,1,?,?,?,?)",
             (
                 job_id,
                 "a" * 64,
@@ -2208,7 +2692,15 @@ def _populate_prior_store(db: Path, worktree: Path, starting_sha: str) -> str:
         conn.execute(
             "INSERT INTO review_operations(op_id,job_id,kind,payload_sha256,"
             "result_json,revision,created_at) VALUES (?,?,?,?,?,?,?)",
-            ("op-1", job_id, "PHASE_TRANSITION", "b" * 64, "{}", 1, now),
+            (
+                "op-1",
+                job_id,
+                "PHASE_TRANSITION",
+                "b" * 64,
+                record_json,
+                1,
+                now,
+            ),
         )
         conn.execute(
             "INSERT INTO review_validation_receipts(receipt_id,job_id,snapshot_sha,"
@@ -2229,32 +2721,20 @@ def _populate_prior_store(db: Path, worktree: Path, starting_sha: str) -> str:
 def test_populated_prior_schema_migrates_and_is_integrity_checked(tmp_path):
     worktree, starting_sha, _ = make_git_worktree(tmp_path)
     db = tmp_path / "review.db"
-    job_id = _populate_prior_store(db, worktree, starting_sha)
+    _populate_prior_store(db, worktree, starting_sha)
 
-    store = ReviewStore(db)
-    with sqlite3.connect(store.path) as conn:
+    with pytest.raises(AdapterError) as raised:
+        ReviewStore(db)
+    assert raised.value.code == "LEGACY_RECEIPT_KEY_REQUIRED"
+    with sqlite3.connect(db) as conn:
         conn.row_factory = sqlite3.Row
-        meta = conn.execute(
-            "SELECT value FROM review_meta WHERE key='schema_version'"
-        ).fetchone()
-        assert meta[0] == SCHEMA_VERSION
-        record = json.loads(
-            conn.execute(
-                "SELECT record_json FROM review_jobs WHERE job_id=?", (job_id,)
-            ).fetchone()[0]
-        )
-        assert record["schema_version"] == SCHEMA_VERSION
-        receipt_challenge = conn.execute(
-            "SELECT challenge_id FROM review_validation_receipts WHERE receipt_id=?",
-            ("rcpt-" + "1" * 48,),
-        ).fetchone()
-        assert receipt_challenge[0] == "c" * 64
-
-    # The migrated job is readable and fully integrity-checked.
-    loaded = store.get(job_id)
-    assert loaded["job_id"] == job_id
-    assert loaded["schema_version"] == SCHEMA_VERSION
-    store.verify_audit_chain(job_id)
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+    assert "review_meta" not in tables
 
 
 def test_prior_schema_corruption_fails_closed(tmp_path):
@@ -2311,3 +2791,102 @@ def test_prior_schema_ambiguous_layout_fails_closed(tmp_path):
         ReviewStore(db)
     assert raised.value.code == "UNSUPPORTED_SCHEMA"
 
+
+def test_durable_receipt_keys_survive_restart_and_reverify_history(tmp_path):
+    worktree, starting_sha, remote = make_git_worktree(tmp_path)
+    key_dir = tmp_path / "receipt-keys"
+    authority = ReceiptAuthority.from_key_directory(key_dir)
+    store = ReviewStore(tmp_path / "review.db", authority=authority)
+    orch = ReviewOrchestrator(
+        store,
+        git=GitVerifier({REPOSITORY_ID: remote}),
+        authority=authority,
+        repository_roots=[tmp_path.resolve()],
+    )
+    payload = create_payload(worktree, starting_sha)
+    orch.create("hermes", payload)
+    challenge = drive_to_reviewing(orch, payload["job_id"])
+    orch.record_review(
+        "codex_mcp",
+        payload["job_id"],
+        {"receipt": build_review_receipt(authority, challenge)},
+    )
+
+    restarted = ReceiptAuthority.from_key_directory(key_dir)
+    assert restarted.review_key_id == authority.review_key_id
+    assert restarted.validation_key_id == authority.validation_key_id
+    assert restarted.capsule_key_id == authority.capsule_key_id
+    ReviewStore(tmp_path / "review.db", authority=restarted)
+    for path in key_dir.iterdir():
+        assert path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("fault", ["permission", "symlink", "corrupt"])
+def test_durable_receipt_key_files_fail_closed(tmp_path, fault):
+    key_dir = tmp_path / "receipt-keys"
+    if fault == "symlink":
+        key_dir.mkdir(mode=0o700)
+        target = tmp_path / "target"
+        target.write_text("{}", encoding="utf-8")
+        target.chmod(0o600)
+        (key_dir / "review-runner.key").symlink_to(target)
+    else:
+        ReceiptAuthority.from_key_directory(key_dir)
+        key = key_dir / "review-runner.key"
+        if fault == "permission":
+            key.chmod(0o644)
+        else:
+            key.write_text("{}", encoding="utf-8")
+            key.chmod(0o600)
+
+    with pytest.raises(AdapterError) as raised:
+        ReceiptAuthority.from_key_directory(key_dir)
+    assert raised.value.code == "RECEIPT_KEY_INVALID"
+
+
+def test_empty_1_2_store_migrates_receipt_metadata_transactionally(tmp_path):
+    db = tmp_path / "review.db"
+    ReviewStore(db)
+    with sqlite3.connect(db) as conn:
+        for table in ("review_runner_receipts", "review_validation_receipts"):
+            conn.execute(f"ALTER TABLE {table} DROP COLUMN signing_key_id")
+            conn.execute(f"ALTER TABLE {table} DROP COLUMN signing_algorithm")
+            conn.execute(f"ALTER TABLE {table} DROP COLUMN proof")
+        conn.execute("UPDATE review_meta SET value='1.2.0' WHERE key='schema_version'")
+
+    ReviewStore(db)
+    with sqlite3.connect(db) as conn:
+        version = conn.execute(
+            "SELECT value FROM review_meta WHERE key='schema_version'"
+        ).fetchone()[0]
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(review_runner_receipts)")
+        }
+    assert version == SCHEMA_VERSION
+    assert {"signing_key_id", "signing_algorithm", "proof"} <= columns
+
+
+def test_legacy_receipt_migration_requires_key_and_rolls_back(tmp_path):
+    orch, _, authority, worktree, starting_sha, _ = make_orchestrator(tmp_path)
+    payload = create_payload(worktree, starting_sha)
+    orch.create("hermes", payload)
+    challenge = drive_to_reviewing(orch, payload["job_id"])
+    orch.record_review(
+        "codex_mcp",
+        payload["job_id"],
+        {"receipt": build_review_receipt(authority, challenge)},
+    )
+    db = tmp_path / "review.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE review_meta SET value='1.2.0' WHERE key='schema_version'")
+
+    with pytest.raises(AdapterError) as raised:
+        ReviewStore(db, authority=authority)
+    assert raised.value.code == "AUDIT_ROLLBACK"
+    with sqlite3.connect(db) as conn:
+        assert (
+            conn.execute(
+                "SELECT value FROM review_meta WHERE key='schema_version'"
+            ).fetchone()[0]
+            == "1.2.0"
+        )
