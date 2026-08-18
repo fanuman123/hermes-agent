@@ -2239,6 +2239,7 @@ def test_child_zero_write_claim_is_not_trusted(tmp_path):
     assert raised.value.code == "ZERO_WRITE_UNPROVEN"
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires the macOS sandbox")
 def test_git_metadata_access_is_os_denied_without_mutation(tmp_path):
     orch, _, _, worktree, starting_sha, remote = make_orchestrator(tmp_path)
     gitdir_marker = (worktree / ".git").read_text(encoding="utf-8").strip()
