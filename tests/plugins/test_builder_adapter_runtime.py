@@ -142,6 +142,7 @@ def _make_settings(
     roots=None,
     codex=None,
     codex_sha256=_DEFAULT_CODEX_DIGEST,
+    codex_trusted_provider=False,
 ):
     profile_id = "hermes-builder-adapter-strict.v1"
     auth_file = tmp_path / "auth.json"
@@ -176,6 +177,7 @@ def _make_settings(
         "codex_executable": codex_executable,
         "codex_version": "0.0.0-test",
         "codex_identity": "codex_mcp",
+        "codex_trusted_provider": codex_trusted_provider,
     }
     if codex_sha256 is _DEFAULT_CODEX_DIGEST:
         config["codex_executable_sha256"] = hashlib.sha256(
@@ -278,6 +280,7 @@ def test_build_runtime_legacy_config_keeps_review_disabled(
     assert settings.codex_executable is None
     assert settings.codex_executable_sha256 is None
     assert settings.codex_interpreter_sha256 is None
+    assert settings.codex_trusted_provider is False
 
     monkeypatch.setattr(
         "plugins.builder_adapter.runtime.GovernanceSnapshot",
@@ -358,8 +361,34 @@ def test_build_runtime_preserves_expected_codex_digest(tmp_path, monkeypatch):
             review_runtime._runner.backend.executable_sha256
             == settings.codex_executable_sha256
         )
+        assert review_runtime._runner.backend.trusted_provider is False
     finally:
         schema_temp.cleanup()
+
+
+def test_build_runtime_wires_explicit_trusted_provider_mode(tmp_path, monkeypatch):
+    _worktree, _starting_sha, remote = make_git_worktree(tmp_path)
+    profile_id, settings = _make_settings(
+        tmp_path, remote, codex_trusted_provider=True
+    )
+    monkeypatch.setattr(
+        "plugins.builder_adapter.runtime.GovernanceSnapshot",
+        lambda repo, commit: _FakeSnapshot(profile_id),
+    )
+    monkeypatch.setenv("HERMES_BUILDER_ADAPTER_SECRET_RUNTIME", "s" * 32)
+
+    _app, schema_temp, review_runtime = build_runtime(settings)
+    try:
+        assert review_runtime is not None
+        assert review_runtime._runner.backend.trusted_provider is True
+    finally:
+        schema_temp.cleanup()
+
+
+def test_runtime_rejects_non_boolean_trusted_provider_mode(tmp_path):
+    _worktree, _starting_sha, remote = make_git_worktree(tmp_path)
+    with pytest.raises(AdapterError, match="codex_trusted_provider must be boolean"):
+        _make_settings(tmp_path, remote, codex_trusted_provider="yes")
 
 
 def test_build_runtime_dispatches_mints_and_accepts_review(tmp_path, monkeypatch):

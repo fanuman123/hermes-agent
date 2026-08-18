@@ -67,6 +67,10 @@ _SANDBOX_SCOPE = (
     "protects_original_worktree_git_metadata_config_state_keys_network_and_writes;"
     "not_whole_host_read_isolation"
 )
+_TRUSTED_PROVIDER_SCOPE = (
+    "parent_proves_original_worktree_git_metadata_and_private_clone_zero_write;"
+    "trusted_provider_has_network_credentials_and_host_capability"
+)
 
 # ── Value-level credential redaction (defense in depth) ─────────────────────
 # Key-name redaction alone misses ``{"command": "tool --token actual-secret"}``.
@@ -252,7 +256,9 @@ class RunnerInvocation(StrictModel):
     sandbox: Literal["read_only", "isolated"] = "read_only"
     sandbox_scope: Literal[
         "protects_original_worktree_git_metadata_config_state_keys_network_and_writes;"
-        "not_whole_host_read_isolation"
+        "not_whole_host_read_isolation",
+        "parent_proves_original_worktree_git_metadata_and_private_clone_zero_write;"
+        "trusted_provider_has_network_credentials_and_host_capability",
     ] = _SANDBOX_SCOPE
     approval_policy: Literal["never", "manual"] = "never"
     command: str = Field(min_length=1, max_length=1000)
@@ -784,6 +790,7 @@ class CodexReviewBackend:
         protected_roots: list[Path] | None = None,
         sandbox_launcher: str | None = None,
         sandbox_launcher_sha256: str | None = None,
+        trusted_provider: bool = False,
     ):
         if not executable:
             raise AdapterError(
@@ -803,6 +810,11 @@ class CodexReviewBackend:
             raise AdapterError(
                 "CODEX_UNAVAILABLE", "read-only Codex runner identity is not configured"
             )
+        if not isinstance(trusted_provider, bool):
+            raise AdapterError(
+                "CODEX_UNAVAILABLE", "trusted review provider mode must be boolean"
+            )
+        self.trusted_provider = trusted_provider
         self.executable = str(resolved)
         observed_sha256 = self._validate_executable()
         if executable_sha256 is not None and not re.fullmatch(_HEX64_RE, executable_sha256):
@@ -1080,7 +1092,9 @@ class CodexReviewBackend:
             "runner": self.identity,
             "runner_version": self.version,
             "sandbox": "read_only",
-            "sandbox_scope": _SANDBOX_SCOPE,
+            "sandbox_scope": (
+                _TRUSTED_PROVIDER_SCOPE if self.trusted_provider else _SANDBOX_SCOPE
+            ),
             "approval_policy": "never",
             "command": " ".join(self._argv()),
         }
@@ -1323,7 +1337,7 @@ class CodexReviewBackend:
         runtime_roots = self._script_runtime_roots(
             protected_roots=protected_roots
         )
-        if self._sandbox_launcher is not None:
+        if self._sandbox_launcher is not None and not self.trusted_provider:
             observed = self._hash_validated_launcher(
                 self._sandbox_launcher,
                 expected_uid=0 if sys.platform == "darwin" else _posix_effective_uid(),
@@ -1342,7 +1356,7 @@ class CodexReviewBackend:
                 ),
                 *argv,
             ]
-        elif sys.platform == "darwin":
+        elif sys.platform == "darwin" and not self.trusted_provider:
             raise AdapterError(
                 "CODEX_UNAVAILABLE", "Darwin review sandbox launcher is unavailable"
             )

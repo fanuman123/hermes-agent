@@ -58,6 +58,7 @@ class RuntimeSettings:
     codex_executable: str | None
     codex_executable_sha256: str | None
     codex_interpreter_sha256: str | None
+    codex_trusted_provider: bool
     codex_version: str | None
     codex_identity: str | None
     codex_timeout_seconds: int | None
@@ -66,6 +67,11 @@ class RuntimeSettings:
     def from_file(cls, path: str | Path) -> "RuntimeSettings":
         value = _read_owner_json(Path(path), exact_mode=None)
         review_state_path = value.get("review_state_path")
+        codex_trusted_provider = value.get("codex_trusted_provider", False)
+        if not isinstance(codex_trusted_provider, bool):
+            raise AdapterError(
+                "INVALID_CONFIG", "codex_trusted_provider must be boolean"
+            )
         return cls(
             config_path=Path(path).resolve(strict=True),
             socket_path=Path(value["socket_path"]),
@@ -95,6 +101,7 @@ class RuntimeSettings:
             codex_executable=value.get("codex_executable"),
             codex_executable_sha256=value.get("codex_executable_sha256"),
             codex_interpreter_sha256=value.get("codex_interpreter_sha256"),
+            codex_trusted_provider=codex_trusted_provider,
             codex_version=value.get("codex_version"),
             codex_identity=value.get("codex_identity"),
             codex_timeout_seconds=value.get("codex_timeout_seconds"),
@@ -349,6 +356,7 @@ def build_runtime(settings: RuntimeSettings):
             timeout_seconds=settings.codex_timeout_seconds or 1800,
             executable_sha256=codex_executable_sha256,
             interpreter_sha256=settings.codex_interpreter_sha256,
+            trusted_provider=settings.codex_trusted_provider,
             protected_roots=[
                 settings.config_path.parent,
                 settings.state_path.parent,

@@ -160,6 +160,33 @@ def test_macos_sandbox_confines_reads_to_private_clone(tmp_path):
     assert secret.read_text(encoding="utf-8") == "original-only-secret\n"
 
 
+def test_explicit_trusted_provider_mode_is_signed_and_runs_without_outer_sandbox(
+    tmp_path,
+):
+    root, _, _ = _repo(tmp_path)
+    executable = _runner(
+        tmp_path,
+        "import json, sys\nsys.stdin.read()\n"
+        "print(json.dumps({'thread_id': 'trusted-provider', 'response': 'ok', "
+        "'findings': []}))\n",
+    )
+    backend = _backend(executable, trusted_provider=True)
+    result = backend.run(
+        prompt="review", cwd=root, challenge_id="c" * 64
+    )
+    assert result.thread_id == "trusted-provider"
+    assert backend.invocation()["sandbox_scope"] == (
+        "parent_proves_original_worktree_git_metadata_and_private_clone_zero_write;"
+        "trusted_provider_has_network_credentials_and_host_capability"
+    )
+
+
+def test_trusted_provider_mode_must_be_boolean(tmp_path):
+    executable = _runner(tmp_path, "raise SystemExit(99)\n")
+    with pytest.raises(AdapterError, match="must be boolean"):
+        _backend(executable, trusted_provider="yes")
+
+
 def test_thread_id_is_redacted_at_the_boundary(tmp_path):
     root, _, _ = _repo(tmp_path)
     executable = _runner(
