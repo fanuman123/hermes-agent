@@ -72,6 +72,23 @@ class DispatchStore:
                     FOREIGN KEY(dispatch_id) REFERENCES dispatches(dispatch_id),
                     CHECK(length(packet_sha256) = 64)
                 );
+                CREATE TABLE IF NOT EXISTS validation_receipts (
+                    dispatch_id TEXT NOT NULL,
+                    snapshot_sha TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    profile_id TEXT NOT NULL,
+                    expected_head_sha TEXT NOT NULL,
+                    tree_sha TEXT NOT NULL,
+                    receipt_json TEXT NOT NULL,
+                    receipt_sha256 TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY (dispatch_id, snapshot_sha),
+                    FOREIGN KEY(dispatch_id) REFERENCES dispatches(dispatch_id),
+                    CHECK(length(snapshot_sha) IN (40, 64)),
+                    CHECK(length(expected_head_sha) IN (40, 64)),
+                    CHECK(length(tree_sha) IN (40, 64)),
+                    CHECK(length(receipt_sha256) = 64)
+                );
                 CREATE TRIGGER IF NOT EXISTS dispatch_reservations_immutable_update
                 BEFORE UPDATE ON dispatch_reservations
                 BEGIN
@@ -81,6 +98,16 @@ class DispatchStore:
                 BEFORE DELETE ON dispatch_reservations
                 BEGIN
                     SELECT RAISE(ABORT, 'dispatch reservation is immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS validation_receipts_immutable_update
+                BEFORE UPDATE ON validation_receipts
+                BEGIN
+                    SELECT RAISE(ABORT, 'validation receipt is immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS validation_receipts_immutable_delete
+                BEFORE DELETE ON validation_receipts
+                BEGIN
+                    SELECT RAISE(ABORT, 'validation receipt is immutable');
                 END;
                 """
             )
@@ -108,6 +135,86 @@ class DispatchStore:
                 """
             )
         self.path.chmod(0o600)
+
+    def record_validation_receipt(self, receipt: dict) -> dict:
+        """Persist one trusted, snapshot-bound passing validation receipt."""
+        validation = receipt.get("validation")
+        if not isinstance(validation, dict) or validation.get("overall_status") != "PASSED":
+            raise AdapterError("VALIDATION_FAILED", "only passing validation can be receipted")
+        required = (
+            "dispatch_id",
+            "snapshot_sha",
+            "task_id",
+            "profile_id",
+            "expected_head_sha",
+            "tree_sha",
+        )
+        if any(not isinstance(receipt.get(key), str) or not receipt[key] for key in required):
+            raise AdapterError("VALIDATION_FAILED", "validation receipt binding is incomplete")
+        receipt_json = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
+        receipt_sha256 = hashlib.sha256(receipt_json.encode()).hexdigest()
+        now = int(time.time())
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT * FROM validation_receipts WHERE dispatch_id=? AND snapshot_sha=?",
+                (receipt["dispatch_id"], receipt["snapshot_sha"]),
+            ).fetchone()
+            if existing:
+                conn.commit()
+                return self.get_validation_receipt(
+                    receipt["dispatch_id"], receipt["snapshot_sha"]
+                )
+            event_id = self.new_event_id()
+            conn.execute(
+                """
+                INSERT INTO validation_receipts(
+                    dispatch_id,snapshot_sha,task_id,profile_id,expected_head_sha,
+                    tree_sha,receipt_json,receipt_sha256,created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    receipt["dispatch_id"],
+                    receipt["snapshot_sha"],
+                    receipt["task_id"],
+                    receipt["profile_id"],
+                    receipt["expected_head_sha"],
+                    receipt["tree_sha"],
+                    receipt_json,
+                    receipt_sha256,
+                    now,
+                ),
+            )
+            self._insert_audit(
+                conn,
+                event_id=event_id,
+                dispatch_id=receipt["dispatch_id"],
+                kind="VALIDATION_RECEIPT_RECORDED",
+                payload={
+                    "snapshot_sha": receipt["snapshot_sha"],
+                    "tree_sha": receipt["tree_sha"],
+                    "profile_id": receipt["profile_id"],
+                    "receipt_sha256": receipt_sha256,
+                },
+                created_at=now,
+            )
+            conn.commit()
+        return self.get_validation_receipt(receipt["dispatch_id"], receipt["snapshot_sha"])
+
+    def get_validation_receipt(self, dispatch_id: str, snapshot_sha: str) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM validation_receipts WHERE dispatch_id=? AND snapshot_sha=?",
+                (dispatch_id, snapshot_sha),
+            ).fetchone()
+        if not row:
+            return None
+        value = dict(row)
+        receipt_json = value["receipt_json"]
+        if hashlib.sha256(receipt_json.encode()).hexdigest() != value["receipt_sha256"]:
+            raise AdapterError("VALIDATION_FAILED", "validation receipt hash mismatch")
+        value["receipt"] = json.loads(receipt_json)
+        return value
 
     def consume_nonce(
         self, key_id: str, nonce: str, expires_at: int, *, now: int | None = None

@@ -13,6 +13,7 @@ from pathlib import Path
 
 
 DEFAULT_CONFIG = "~/.hermes/builder-adapter/runtime.json"
+IS_DARWIN = sys.platform == "darwin"
 
 
 def build_orchestrate_parser(subparsers, *, cmd_orchestrate):
@@ -114,7 +115,7 @@ def _print_result(result: dict, *, raw: bool = False) -> None:
 def _restart_launch_agent(args, settings, client) -> dict:
     from plugins.builder_adapter.errors import AdapterError
 
-    if sys.platform != "darwin":
+    if not IS_DARWIN:
         raise AdapterError(
             "PROVIDER_UNAVAILABLE", "adapter restart is supported only on macOS"
         )
@@ -123,7 +124,7 @@ def _restart_launch_agent(args, settings, client) -> dict:
     if args.timeout <= 0 or args.timeout > 120:
         raise AdapterError("INVALID_REQUEST", "restart timeout must be 1-120 seconds")
 
-    target = f"gui/{os.getuid()}/{args.label}"
+    target = f"gui/{os.getuid()}/{args.label}"  # windows-footgun: ok — Darwin-only
     previous_process_id = None
     try:
         previous_process_id = client.health().get("process_id")

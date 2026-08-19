@@ -7,6 +7,7 @@ import json
 import os
 import plistlib
 import secrets
+import stat
 import subprocess
 import sys
 import tempfile
@@ -86,7 +87,7 @@ def _darwin_user_temp_dir() -> Path:
             candidate.is_symlink()
             or not root.is_absolute()
             or not root.is_dir()
-            or stat.st_uid != os.getuid()
+            or stat.st_uid != os.getuid()  # windows-footgun: ok — Darwin-only
             or stat.st_mode & 0o077
         ):
             continue
@@ -121,7 +122,7 @@ class _UnverifiedLaunchdContainmentProbe:
                 "VALIDATION_CONTAINMENT_UNAVAILABLE",
                 "OS-owned disposable validation unit is unavailable",
             )
-        uid = os.getuid()
+        uid = os.getuid()  # windows-footgun: ok — Darwin-only
         token = secrets.token_hex(16)
         safe_scope = "".join(
             character if character.isalnum() else "-"
@@ -196,7 +197,9 @@ class _UnverifiedLaunchdContainmentProbe:
                 while time.monotonic() < deadline:
                     if result_path.is_file():
                         try:
-                            result = json.loads(result_path.read_text("utf-8"))
+                            result = json.loads(
+                                result_path.read_text(encoding="utf-8")
+                            )
                             break
                         except (OSError, ValueError):
                             supervisor_error = True
@@ -308,6 +311,44 @@ class _DockerContainment:
                     "validation source contains a non-regular Git object",
                 )
 
+    @staticmethod
+    def _verify_materialized_regular_tree(worktree: Path) -> None:
+        """Verify a plumbing-materialized tree that intentionally has no .git."""
+        for raw_root, directories, files in os.walk(worktree, followlinks=False):
+            root = Path(raw_root)
+            root_info = root.lstat()
+            if root.is_symlink() or not stat.S_ISDIR(root_info.st_mode):
+                raise AdapterError(
+                    "MANIFEST_MISMATCH", "validation source contains an unsafe directory"
+                )
+            for name in directories:
+                path = root / name
+                info = path.lstat()
+                if path.is_symlink() or not stat.S_ISDIR(info.st_mode):
+                    raise AdapterError(
+                        "MANIFEST_MISMATCH", "validation source contains an unsafe directory"
+                    )
+            for name in files:
+                path = root / name
+                info = path.lstat()
+                if path.is_symlink() or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise AdapterError(
+                        "MANIFEST_MISMATCH", "validation source contains an unsafe file"
+                    )
+
+    @staticmethod
+    def _archive_argv(worktree: Path, commit: str, *, materialized: bool) -> list[str]:
+        if materialized:
+            return ["/usr/bin/tar", "-cf", "-", "-C", str(worktree), "."]
+        return [
+            "/usr/bin/git",
+            "-C",
+            str(worktree),
+            "archive",
+            "--format=tar",
+            commit,
+        ]
+
     def run(
         self,
         profile_id: str,
@@ -316,8 +357,12 @@ class _DockerContainment:
         commit: str,
         *,
         scope_id: str,
+        materialized: bool = False,
     ) -> dict:
-        self._verify_regular_tree(worktree, commit)
+        if materialized:
+            self._verify_materialized_regular_tree(worktree)
+        else:
+            self._verify_regular_tree(worktree, commit)
         safe_scope = "".join(
             character if character.isalnum() else "-"
             for character in scope_id[:36]
@@ -354,14 +399,9 @@ class _DockerContainment:
                 )
                 volume_created = True
                 archive = subprocess.Popen(
-                    [
-                        "/usr/bin/git",
-                        "-C",
-                        str(worktree),
-                        "archive",
-                        "--format=tar",
-                        commit,
-                    ],
+                    self._archive_argv(
+                        worktree, commit, materialized=materialized
+                    ),
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     env={
@@ -372,32 +412,41 @@ class _DockerContainment:
                     },
                 )
                 assert archive.stdout is not None
-                populated = subprocess.run(
-                    [
-                        self.docker,
-                        "run",
-                        "--rm",
-                        "-i",
-                        "--network",
-                        "none",
-                        "--read-only",
-                        "--user",
-                        "0:0",
-                        "--entrypoint",
-                        "/bin/tar",
-                        "--mount",
-                        f"type=volume,src={volume},dst=/work/source",
-                        self.image_id,
-                        "-xf",
-                        "-",
-                        "-C",
-                        "/work/source",
-                    ],
-                    stdin=archive.stdout,
-                    capture_output=True,
-                    timeout=300,
-                    env=self._environment(docker_config),
-                )
+                try:
+                    populated = subprocess.run(
+                        [
+                            self.docker,
+                            "run",
+                            "--rm",
+                            "-i",
+                            "--network",
+                            "none",
+                            "--read-only",
+                            "--user",
+                            "0:0",
+                            "--entrypoint",
+                            "/bin/tar",
+                            "--mount",
+                            f"type=volume,src={volume},dst=/work/source",
+                            self.image_id,
+                            "-xf",
+                            "-",
+                            "-C",
+                            "/work/source",
+                        ],
+                        stdin=archive.stdout,
+                        capture_output=True,
+                        timeout=1200,
+                        env=self._environment(docker_config),
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    archive.stdout.close()
+                    archive.kill()
+                    archive.communicate()
+                    raise AdapterError(
+                        "VALIDATION_CONTAINMENT_UNAVAILABLE",
+                        "sealed source export timed out",
+                    ) from exc
                 archive.stdout.close()
                 archive_stderr = archive.communicate(timeout=30)[1]
                 if archive.returncode != 0 or populated.returncode != 0:
@@ -580,6 +629,7 @@ class ValidationRunner:
                 worktree,
                 expected_sha,
                 scope_id=scope_id,
+                materialized=materialized_sha is not None,
             )
         raise AdapterError(
             "VALIDATION_CONTAINMENT_UNAVAILABLE",
