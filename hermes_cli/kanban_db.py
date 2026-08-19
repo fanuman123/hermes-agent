@@ -3264,6 +3264,7 @@ def create_task(
             or not isinstance(worker_policy.get("policy_id"), str)
             or not worker_policy["policy_id"]
             or not isinstance(worker_policy.get("tool_allowlist"), list)
+            or not worker_policy["tool_allowlist"]
             or not all(
                 isinstance(name, str) and name
                 for name in worker_policy["tool_allowlist"]
@@ -8308,6 +8309,9 @@ def _process_group_terminated(process_group: int) -> bool:
     except ProcessLookupError:
         return True
     except (PermissionError, OSError):
+        # A reused process-group id and an inaccessible live group are both
+        # indistinguishable from here.  Fail closed: only ESRCH is positive
+        # proof that the governed worker's complete process group is gone.
         return False
     return False
 
@@ -9651,7 +9655,12 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
             and isinstance(policy, dict)
             and policy.get("completion_requires_exit_proof") is True
         ):
-            start_identity = _kernel_process_start_identity(int(pid))
+            try:
+                start_identity = _kernel_process_start_identity(int(pid))
+            except (OSError, ProcessLookupError) as exc:
+                raise RuntimeError(
+                    "unable to attest spawned worker process identity"
+                ) from exc
             try:
                 process_group = os.getpgid(int(pid))
             except OSError:

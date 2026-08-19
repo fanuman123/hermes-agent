@@ -76,6 +76,70 @@ def test_governed_completion_retains_worker_lease_until_exit(kanban_home):
         assert pending.completed_at is None
 
 
+def test_governed_spawn_fails_closed_without_kernel_identity(
+    kanban_home, monkeypatch
+):
+    fake_pid = 987653
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="governed",
+            assignee="deepseek-builder",
+            created_by="hermes.builder_dispatch.v1",
+            worker_policy=BUILDER_WORKER_POLICY,
+        )
+        assert kb.claim_task(conn, task_id, claimer=f"{kb._claimer_id()}:lease")
+        monkeypatch.setattr(
+            kb,
+            "_kernel_process_start_identity",
+            lambda _pid: (_ for _ in ()).throw(ProcessLookupError()),
+        )
+
+        with pytest.raises(RuntimeError, match="unable to attest"):
+            kb._set_worker_pid(conn, task_id, fake_pid)
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.worker_pid is None
+        assert conn.execute(
+            "SELECT 1 FROM governed_worker_lifecycle WHERE task_id=?",
+            (task_id,),
+        ).fetchone() is None
+
+
+def test_governed_worker_policy_rejects_empty_tool_allowlist(kanban_home):
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="invalid worker_policy"):
+            kb.create_task(
+                conn,
+                title="governed",
+                assignee="deepseek-builder",
+                created_by="hermes.builder_dispatch.v1",
+                worker_policy={
+                    "policy_id": "hermes.builder_worker.v1",
+                    "tool_allowlist": [],
+                    "completion_requires_exit_proof": True,
+                },
+            )
+
+
+def test_process_group_termination_requires_positive_absence_proof(monkeypatch):
+    process_group = 987652
+    monkeypatch.setattr(
+        os,
+        "killpg",
+        lambda _pgid, _signal: (_ for _ in ()).throw(PermissionError()),
+    )
+    assert kb._process_group_terminated(process_group) is False
+
+    monkeypatch.setattr(
+        os,
+        "killpg",
+        lambda _pgid, _signal: (_ for _ in ()).throw(ProcessLookupError()),
+    )
+    assert kb._process_group_terminated(process_group) is True
+
+
 def test_governed_completion_requires_callback_and_process_group_cleanup(
     kanban_home, monkeypatch
 ):

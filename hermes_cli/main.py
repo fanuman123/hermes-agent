@@ -9998,13 +9998,27 @@ def _downstream_update_guard_status(
     return blocked
 
 
-def _enforce_downstream_update_guard(repo_root: Path, target_branch: str) -> None:
+def _enforce_downstream_update_guard(
+    repo_root: Path,
+    target_branch: str,
+    *,
+    force_downstream_guard: bool = False,
+) -> None:
     try:
         blocked = _downstream_update_guard_status(repo_root, target_branch)
     except RuntimeError as exc:
+        if force_downstream_guard:
+            print(f"WARNING: overriding downstream update guard error: {exc}.")
+            return
         print(f"Refusing update: {exc}.")
         sys.exit(2)
     if blocked:
+        if force_downstream_guard:
+            print(
+                "WARNING: overriding protected downstream update guard(s): "
+                f"{', '.join(blocked)}."
+            )
+            return
         print("Refusing update while protected downstream commits are not upstream.")
         print(f"  Guard(s): {', '.join(blocked)}")
         print(

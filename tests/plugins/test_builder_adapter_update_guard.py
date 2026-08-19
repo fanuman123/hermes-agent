@@ -1,5 +1,6 @@
 import json
 import subprocess
+from argparse import ArgumentParser
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -7,6 +8,8 @@ import pytest
 
 from hermes_cli import main as cli_main
 from hermes_cli.main import _downstream_update_guard_status
+from hermes_cli.main import _enforce_downstream_update_guard
+from hermes_cli.subcommands.update import build_update_parser
 
 
 def _git(root: Path, *args: str) -> str:
@@ -55,6 +58,53 @@ def test_update_guard_blocks_until_anchor_is_in_remote_target(tmp_path):
     assert _downstream_update_guard_status(tmp_path, "main") == ["stage1"]
     _git(tmp_path, "update-ref", "refs/remotes/origin/main", anchor)
     assert _downstream_update_guard_status(tmp_path, "main") == []
+
+
+def test_update_guard_requires_explicit_operator_override(tmp_path, capsys):
+    base, anchor = _repository(tmp_path)
+    _guard(tmp_path, anchor)
+    _git(tmp_path, "update-ref", "refs/remotes/origin/main", base)
+
+    with pytest.raises(SystemExit) as exc:
+        _enforce_downstream_update_guard(tmp_path, "main")
+    assert exc.value.code == 2
+
+    _enforce_downstream_update_guard(
+        tmp_path,
+        "main",
+        force_downstream_guard=True,
+    )
+    output = capsys.readouterr().out
+    assert "WARNING" in output
+    assert "stage1" in output
+
+
+def test_update_guard_override_is_explicit_for_invalid_manifest(tmp_path, capsys):
+    _repository(tmp_path)
+    (tmp_path / ".hermes-update-guard.json").write_text("{}")
+
+    _enforce_downstream_update_guard(
+        tmp_path,
+        "main",
+        force_downstream_guard=True,
+    )
+    output = capsys.readouterr().out
+    assert "WARNING" in output
+    assert "invalid" in output
+
+
+def test_update_guard_override_requires_named_cli_flag():
+    parser = ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    build_update_parser(subparsers, cmd_update=lambda _args: None)
+
+    assert parser.parse_args(["update"]).force_downstream_guard is False
+    assert (
+        parser.parse_args(
+            ["update", "--force-downstream-guard"]
+        ).force_downstream_guard
+        is True
+    )
 
 
 def test_update_guard_allows_history_after_exact_anchor_is_rebased_away(tmp_path):
@@ -130,7 +180,7 @@ def test_update_guard_blocks_before_service_pause_or_checkout_mutation(
     monkeypatch.setattr(
         cli_main,
         "_enforce_downstream_update_guard",
-        lambda *_args: (_ for _ in ()).throw(GuardReached()),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(GuardReached()),
     )
     monkeypatch.setattr(
         cli_main,
@@ -139,6 +189,12 @@ def test_update_guard_blocks_before_service_pause_or_checkout_mutation(
     )
     with pytest.raises(GuardReached):
         cli_main._cmd_update_impl(
-            SimpleNamespace(yes=True, force=False, force_venv=False, branch=None),
+            SimpleNamespace(
+                yes=True,
+                force=False,
+                force_venv=False,
+                force_downstream_guard=False,
+                branch=None,
+            ),
             gateway_mode=False,
         )
