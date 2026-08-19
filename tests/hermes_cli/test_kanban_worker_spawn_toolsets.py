@@ -72,7 +72,8 @@ agent:
         captured["cmd"] = list(cmd)
         captured["env"] = dict(kwargs.get("env") or {})
         captured["cwd"] = kwargs.get("cwd")
-        return FakeProc()
+        captured["proc"] = FakeProc()
+        return captured["proc"]
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
 
@@ -81,6 +82,10 @@ agent:
     pid = kb._default_spawn(_make_task(kb, assignee="elias"), str(workspace))
 
     assert pid == 4242
+    assert kb._worker_process_handles[pid] is captured["proc"]
+    kb._record_worker_exit(pid, 0)
+    assert pid not in kb._worker_process_handles
+    kb._recent_worker_exits.pop(pid, None)
     assert captured["env"]["HERMES_HOME"] == str(profile)
     assert captured["env"]["HERMES_KANBAN_TASK"] == "t_spawn_tools"
     assert "--toolsets" in captured["cmd"]
