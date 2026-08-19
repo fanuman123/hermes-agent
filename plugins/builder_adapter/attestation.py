@@ -392,9 +392,10 @@ class HermesProfileResolver:
         # a tool or creates/claims a task.
         worker_env["HERMES_KANBAN_TASK"] = "__builder_profile_attestation__"
         try:
-            definitions = _compute_tool_definitions(
-                list(configured_toolsets or []), quiet_mode=True
-            )
+            with _profile_scope(profile_dir):
+                definitions = _compute_tool_definitions(
+                    list(configured_toolsets or []), quiet_mode=True
+                )
         finally:
             for marker_name, previous in previous_markers.items():
                 if previous is None:

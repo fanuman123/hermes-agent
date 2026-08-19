@@ -2,12 +2,13 @@ import { atom } from 'nanostores'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { NO_PROJECT_ID, type SidebarProjectTree } from '@/app/chat/sidebar/projects/workspace-groups'
-import { $sidebarAgentsGrouped } from '@/store/layout'
+import { $sidebarAgentsGrouped, setSidebarAgentsGrouped } from '@/store/layout'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $currentCwd, $selectedStoredSessionId, $sessions, applyConfiguredDefaultProjectDir } from '@/store/session'
 
 import {
   $activeProjectId,
+  $projects,
   $projectScope,
   $projectsRpcAvailable,
   $projectTree,
@@ -29,6 +30,7 @@ import {
   refreshWorktrees,
   resolveNewSessionCwd,
   scanAndRecordRepos,
+  startWorkInRepo,
   tombstoneSessions
 } from './projects'
 
@@ -53,7 +55,10 @@ vi.mock('@/store/gateway', () => ({
   ensureActiveGatewayOpen: vi.fn()
 }))
 
-vi.mock('@/lib/desktop-git', () => ({ desktopGit: vi.fn() }))
+vi.mock('@/lib/desktop-git', async importOriginal => ({
+  ...((await importOriginal()) as Record<string, unknown>),
+  desktopGit: vi.fn()
+}))
 
 vi.mock('@/hermes', () => ({
   getHermesConfig: vi.fn(),
@@ -274,6 +279,33 @@ describe('worktree refresh', () => {
   })
 })
 
+describe('startWorkInRepo remote capability gate (#81724)', () => {
+  it('names the stale-backend remedy when a remote gateway lacks the worktree route', async () => {
+    isDesktopFsRemoteMode.mockReturnValue(true)
+    desktopGit.mockReturnValue({
+      worktreeAdd: vi.fn(async () => {
+        throw new Error(
+          'Expected JSON from https://vps/api/git/worktree/add but got HTML (status 404). The endpoint is likely missing on the Hermes backend.'
+        )
+      })
+    } as never)
+
+    // The i18n mock echoes keys, so the surfaced error is the catalog key.
+    await expect(startWorkInRepo('/srv/repo', { branch: 'x' })).rejects.toThrow('sidebar.projects.worktreeStaleBackend')
+  })
+
+  it('re-throws real git failures untouched (a remote 400 is not a capability verdict)', async () => {
+    isDesktopFsRemoteMode.mockReturnValue(true)
+    desktopGit.mockReturnValue({
+      worktreeAdd: vi.fn(async () => {
+        throw new Error("400: fatal: 'stale' is not a commit")
+      })
+    } as never)
+
+    await expect(startWorkInRepo('/srv/repo', { branch: 'x' })).rejects.toThrow('not a commit')
+  })
+})
+
 describe('pickProjectFolder', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -311,7 +343,7 @@ describe('pickProjectFolder', () => {
 describe('createProject', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    $sidebarAgentsGrouped.set(false)
+    setSidebarAgentsGrouped(false)
     $activeProjectId.set(null)
     $projectsRpcAvailable.set(null)
   })
@@ -367,6 +399,34 @@ describe('projects RPC capability', () => {
     await refreshProjects()
 
     expect($projectsRpcAvailable.get()).toBe(false)
+  })
+
+  it('does not publish a late project list from the previous source', async () => {
+    let resolveA: ((value: unknown) => void) | undefined
+
+    const responseA = new Promise(resolve => {
+      resolveA = resolve
+    })
+
+    const gatewayA = { connectionState: 'open', request: vi.fn(() => responseA) }
+
+    const gatewayB = {
+      connectionState: 'open',
+      request: vi.fn().mockResolvedValue({ active_id: null, projects: [{ id: 'source-b', name: 'Source B' }] })
+    }
+
+    let current = gatewayA
+
+    activeGateway.mockImplementation(() => current as never)
+    const pendingA = refreshProjects()
+
+    current = gatewayB
+    await refreshProjects()
+
+    resolveA?.({ active_id: null, projects: [{ id: 'source-a', name: 'Source A' }] })
+    await pendingA
+
+    expect($projects.get().map(project => project.id)).toEqual(['source-b'])
   })
 
   it('blocks opening the create dialog once the backend is known stale', () => {
