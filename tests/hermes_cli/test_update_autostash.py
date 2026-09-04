@@ -60,7 +60,7 @@ def _setup_update_mocks(monkeypatch, tmp_path):
     (tmp_path / ".git").mkdir()
     monkeypatch.setattr(hermes_main, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(
-        hermes_main, "_enforce_downstream_update_guard", lambda *_a, **_kw: None
+        hermes_main, "_enforce_downstream_update_guard", lambda *a, **kw: None
     )
     monkeypatch.setattr(hermes_main, "_stash_local_changes_if_needed", lambda *a, **kw: None)
     monkeypatch.setattr(hermes_main, "_restore_stashed_changes", lambda *a, **kw: True)

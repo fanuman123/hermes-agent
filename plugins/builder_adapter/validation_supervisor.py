@@ -55,7 +55,12 @@ def main() -> int:
         ):
             return 65
         started = time.time()
-        process = subprocess.Popen(argv, cwd=cwd, env=env)
+        process = subprocess.Popen(
+            argv,
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+        )
         status = process.wait()
         _write_result(
             result_path,

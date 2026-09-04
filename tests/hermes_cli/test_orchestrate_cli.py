@@ -108,7 +108,7 @@ def test_restart_launch_agent_waits_for_exact_registry(monkeypatch):
         def health(self):
             return next(self.responses)
 
-    monkeypatch.setattr("hermes_cli.subcommands.orchestrate.sys.platform", "darwin")
+    monkeypatch.setattr("hermes_cli.subcommands.orchestrate.IS_DARWIN", True)
     monkeypatch.setattr(
         "hermes_cli.subcommands.orchestrate.os.getuid", lambda: 501, raising=False
     )

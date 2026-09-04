@@ -19,6 +19,26 @@ from plugins.builder_adapter.store import DispatchStore
 from plugins.builder_adapter import plugin_tools
 
 
+def test_worker_validation_runner_binds_configured_docker_backend(tmp_path):
+    docker = tmp_path / "docker"
+    docker.write_text("placeholder", encoding="utf-8")
+    image_id = "sha256:" + "7" * 64
+    runner = plugin_tools._validation_runner(
+        "strict.v1",
+        {"profile_id": "strict.v1"},
+        {
+            "validation_docker_binary": str(docker),
+            "validation_docker_host": "unix:///private/tmp/validation.sock",
+            "validation_image_id": image_id,
+        },
+    )
+
+    assert runner._docker is not None
+    assert runner._docker.docker == str(docker.resolve())
+    assert runner._docker.docker_host == "unix:///private/tmp/validation.sock"
+    assert runner._docker.image_id == image_id
+
+
 def manifest():
     return AllowedPathManifest(
         {

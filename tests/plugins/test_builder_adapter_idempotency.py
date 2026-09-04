@@ -239,6 +239,39 @@ def test_audit_chain_is_tamper_evident_and_recursively_redacted(tmp_path):
         previous = row["event_hash"]
 
 
+def test_validation_receipt_is_snapshot_bound_immutable_and_hash_checked(tmp_path):
+    store = DispatchStore(tmp_path / "journal.db")
+    dispatch_id = "00000000-0000-4000-8000-000000000001"
+    store.reserve(dispatch_id, "v" * 32, "a" * 64, "CYCLE", "principal")
+    receipt = {
+        "schema_version": "1.0.0",
+        "dispatch_id": dispatch_id,
+        "snapshot_sha": "b" * 40,
+        "task_id": "t_receipt",
+        "profile_id": "strict.v1",
+        "expected_head_sha": "c" * 40,
+        "tree_sha": "d" * 40,
+        "validation": {"overall_status": "PASSED", "commands": []},
+    }
+    stored = store.record_validation_receipt(receipt)
+    assert stored["receipt"] == receipt
+    assert store.record_validation_receipt(receipt)["receipt_sha256"] == stored["receipt_sha256"]
+    with sqlite3.connect(store.path) as conn, pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "UPDATE validation_receipts SET tree_sha=? WHERE dispatch_id=?",
+            ("e" * 40, dispatch_id),
+        )
+    with sqlite3.connect(store.path) as conn:
+        conn.execute("DROP TRIGGER validation_receipts_immutable_update")
+        conn.execute(
+            "UPDATE validation_receipts SET receipt_json=? WHERE dispatch_id=?",
+            ("{}", dispatch_id),
+        )
+    with pytest.raises(AdapterError) as raised:
+        store.get_validation_receipt(dispatch_id, receipt["snapshot_sha"])
+    assert raised.value.code == "VALIDATION_FAILED"
+
+
 def test_failed_audit_insert_rolls_back_state_transition(tmp_path):
     store = DispatchStore(tmp_path / "journal.db")
     dispatch_id = "00000000-0000-0000-0000-000000000001"

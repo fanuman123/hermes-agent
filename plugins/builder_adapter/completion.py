@@ -14,11 +14,34 @@ from .gitops import GitVerifier, _run_git
 
 
 class CompletionAttestor:
-    def __init__(self, git: GitVerifier, validation, schemas, effective_profile):
+    def __init__(self, git: GitVerifier, validation, schemas, effective_profile, store=None):
         self.git = git
         self.validation = validation
         self.schemas = schemas
         self.effective_profile = effective_profile
+        self.store = store
+
+    def _validated_receipt(self, request, snapshot, snapshot_sha: str, tree_sha: str):
+        if self.store is None:
+            return None
+        stored = self.store.get_validation_receipt(str(request.dispatch_id), snapshot_sha)
+        if stored is None:
+            return None
+        receipt = stored["receipt"]
+        expected = {
+            "dispatch_id": str(request.dispatch_id),
+            "task_id": snapshot.task_id,
+            "profile_id": request.validation_profile,
+            "expected_head_sha": request.expected_head_sha,
+            "snapshot_sha": snapshot_sha,
+            "tree_sha": tree_sha,
+        }
+        if any(receipt.get(key) != value for key, value in expected.items()):
+            raise AdapterError("VALIDATION_FAILED", "validation receipt binding mismatch")
+        validation = receipt.get("validation")
+        if not isinstance(validation, dict) or validation.get("overall_status") != "PASSED":
+            raise AdapterError("VALIDATION_FAILED", "validation receipt is not passing")
+        return validation
 
     @staticmethod
     def _blob(repo: Path, commit: str, path: str) -> str | None:
@@ -205,12 +228,18 @@ class CompletionAttestor:
         committed = self.git.changed_paths(root, base, resulting)
         self.git.verify_paths(root, committed, manifest)
         self.git.verify_file_types(root, committed)
-        validation = self.validation.run(
-            request.validation_profile,
-            root,
-            resulting,
-            scope_id=str(request.dispatch_id),
-        )
+        tree = _run_git(root, "rev-parse", f"{resulting}^{{tree}}").stdout.decode().strip()
+        snapshot_commit = _run_git(
+            root, "commit-tree", tree, "-p", base, env=self._git_identity_env()
+        ).stdout.decode().strip()
+        validation = self._validated_receipt(request, snapshot, snapshot_commit, tree)
+        if validation is None:
+            validation = self.validation.run(
+                request.validation_profile,
+                root,
+                resulting,
+                scope_id=str(request.dispatch_id),
+            )
         if validation["overall_status"] != "PASSED":
             raise AdapterError("VALIDATION_FAILED", "reconciled validation failed")
         return self._build_evidence(
@@ -294,15 +323,17 @@ class CompletionAttestor:
                 base,
                 env=env,
             ).stdout.decode().strip()
-            validation_root = Path(tmp) / "validation"
-            self.git.materialize_tree(root, snapshot_commit, validation_root)
-            validation = self.validation.run(
-                request.validation_profile,
-                validation_root,
-                snapshot_commit,
-                materialized_sha=snapshot_commit,
-                scope_id=str(request.dispatch_id),
-            )
+            validation = self._validated_receipt(request, snapshot, snapshot_commit, tree)
+            if validation is None:
+                validation_root = Path(tmp) / "validation"
+                self.git.materialize_tree(root, snapshot_commit, validation_root)
+                validation = self.validation.run(
+                    request.validation_profile,
+                    validation_root,
+                    snapshot_commit,
+                    materialized_sha=snapshot_commit,
+                    scope_id=str(request.dispatch_id),
+                )
             if validation["overall_status"] != "PASSED":
                 raise AdapterError("VALIDATION_FAILED", "registered validation failed")
 

@@ -461,8 +461,8 @@ class BuilderDispatchAdapter:
             return self._reject("dispatch", principal, payload, error)
 
     def _status_for_record(self, record: dict, *, operation: str) -> dict:
-        snapshot = self.kanban.snapshot(record["task_id"])
-        if snapshot.status == "done":
+        task_snapshot = self.kanban.snapshot(record["task_id"])
+        if task_snapshot.status == "done":
             if record.get("result_json") and record.get("phase") == "COMPLETED":
                 return json.loads(record["result_json"])
             if (
@@ -514,10 +514,11 @@ class BuilderDispatchAdapter:
                 self.validation,
                 self.schemas,
                 effective_profile,
+                self.store,
             )
             evidence = completion.complete(
                 request,
-                governance_snapshot,
+                task_snapshot,
                 record["principal"],
                 record["request_sha256"],
                 manifest,
@@ -535,9 +536,9 @@ class BuilderDispatchAdapter:
                 status="SUCCEEDED",
                 side_effects_state="STARTED",
                 terminal=True,
-                attempt_count=snapshot.attempt_count,
-                task_id=snapshot.task_id,
-                run_ids=snapshot.run_ids,
+                attempt_count=task_snapshot.attempt_count,
+                task_id=task_snapshot.task_id,
+                run_ids=task_snapshot.run_ids,
                 evidence=evidence,
                 audit_refs=[audit],
             )
@@ -562,7 +563,7 @@ class BuilderDispatchAdapter:
                 result=result,
             )
             return result
-        status, terminal = STATUS_MAP.get(snapshot.status, ("UNKNOWN", False))
+        status, terminal = STATUS_MAP.get(task_snapshot.status, ("UNKNOWN", False))
         errors = []
         side_effects = "STARTED"
         if status == "UNKNOWN":
@@ -581,9 +582,9 @@ class BuilderDispatchAdapter:
             status=status,
             side_effects_state=side_effects,
             terminal=terminal,
-            attempt_count=snapshot.attempt_count,
-            task_id=snapshot.task_id,
-            run_ids=snapshot.run_ids,
+            attempt_count=task_snapshot.attempt_count,
+            task_id=task_snapshot.task_id,
+            run_ids=task_snapshot.run_ids,
             errors=errors,
         )
 

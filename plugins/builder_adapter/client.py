@@ -33,8 +33,8 @@ class OperatorKey:
 def load_operator_key(settings: RuntimeSettings, key_id: str | None = None) -> OperatorKey:
     """Select an active key authorized for the current local process."""
     auth = _read_owner_json(settings.auth_file, exact_mode=0o600)
-    uid = os.geteuid()
-    gid = os.getegid()
+    uid = os.geteuid()  # windows-footgun: ok — Unix peer credentials
+    gid = os.getegid()  # windows-footgun: ok — Unix peer credentials
     matches = []
     for item in auth.get("keys", []):
         if key_id is not None and item.get("key_id") != key_id:
@@ -132,13 +132,13 @@ class BuilderAdapterClient:
         query: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         body = canonical_json_bytes(payload) if payload is not None else b""
-        headers = self._headers(method, path, body)
-        headers.update({"Accept": "application/json", "Connection": "close"})
-        if payload is not None:
-            headers["Content-Type"] = "application/json"
         target = path
         if query:
             target = f"{path}?{urlencode(query)}"
+        headers = self._headers(method, target, body)
+        headers.update({"Accept": "application/json", "Connection": "close"})
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
         status, raw = self.transport(method, target, body, headers)
         try:
             result = json.loads(raw)
@@ -185,3 +185,40 @@ class BuilderAdapterClient:
             {"cycle_id": cycle_id, "reason_code": reason_code},
         )
 
+    def create_review_job(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.request("POST", "/v1/review-jobs", payload)
+
+    def get_review_job(self, job_id: str) -> dict[str, Any]:
+        return self.request("GET", f"/v1/review-jobs/{job_id}")
+
+    def list_review_jobs(
+        self, *, phase: str | None = None, status: str | None = None
+    ) -> dict[str, Any]:
+        query = {}
+        if phase is not None:
+            query["phase"] = phase
+        if status is not None:
+            query["status"] = status
+        return self.request("GET", "/v1/review-jobs", query=query or None)
+
+    def transition_review_job(
+        self, job_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        return self.request("POST", f"/v1/review-jobs/{job_id}/transition", payload)
+
+    def record_review(self, job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.request("POST", f"/v1/review-jobs/{job_id}/review", payload)
+
+    def record_verification(
+        self, job_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        return self.request("POST", f"/v1/review-jobs/{job_id}/verification", payload)
+
+    def get_review_challenge(self, job_id: str) -> dict[str, Any]:
+        return self.request("GET", f"/v1/review-jobs/{job_id}/review-challenge")
+
+    def get_verification_challenge(self, job_id: str) -> dict[str, Any]:
+        return self.request("GET", f"/v1/review-jobs/{job_id}/verification-challenge")
+
+    def review_evidence_capsule(self, job_id: str) -> dict[str, Any]:
+        return self.request("GET", f"/v1/review-jobs/{job_id}/evidence-capsule")

@@ -264,6 +264,77 @@ def test_completion_detects_mutation_during_snapshot_validation(tmp_path):
     assert head == base
 
 
+def test_completion_reuses_exact_worker_validation_receipt(tmp_path):
+    base = repo(tmp_path)
+    (tmp_path / "plugins/builder_adapter/new.py").write_text("safe\n")
+    branch = subprocess.run(
+        ["git", "-C", str(tmp_path), "branch", "--show-current"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    dispatch_id = str(uuid4())
+    task_id = "t_receipt"
+
+    class ValidationMustNotRun:
+        def run(self, *_args, **_kwargs):
+            raise AssertionError("duplicate validation must not run")
+
+    class ReceiptStore:
+        def get_validation_receipt(self, observed_dispatch_id, snapshot_sha):
+            assert observed_dispatch_id == dispatch_id
+            tree = subprocess.run(
+                ["git", "-C", str(tmp_path), "rev-parse", f"{snapshot_sha}^{{tree}}"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            return {
+                "receipt": {
+                    "dispatch_id": dispatch_id,
+                    "task_id": task_id,
+                    "profile_id": "strict.v1",
+                    "expected_head_sha": base,
+                    "snapshot_sha": snapshot_sha,
+                    "tree_sha": tree,
+                    "validation": {
+                        "profile": "strict.v1",
+                        "commands": [],
+                        "overall_status": "PASSED",
+                    },
+                }
+            }
+
+    request = SimpleNamespace(
+        dispatch_id=dispatch_id,
+        cycle_id="FEAT_RECEIPT_001",
+        worktree_path=str(tmp_path),
+        validation_profile="strict.v1",
+        expected_head_sha=base,
+        branch=branch,
+        repository=SimpleNamespace(
+            repository_id="hermes-agent",
+            canonical_remote="git@example.invalid:hermes.git",
+        ),
+    )
+    attestor = CompletionAttestor(
+        GitVerifier({}),
+        ValidationMustNotRun(),
+        SimpleNamespace(validate=lambda *_: None),
+        SimpleNamespace(evidence=lambda: {}),
+        ReceiptStore(),
+    )
+    evidence = attestor.complete(
+        request,
+        SimpleNamespace(task_id=task_id, run_ids=["r_receipt"]),
+        "principal",
+        "f" * 64,
+        manifest(),
+    )
+    assert evidence["validation"]["overall_status"] == "PASSED"
+    assert evidence["git"]["final_dirty_state"] == "CLEAN"
+
+
 def test_repository_verifier_requires_a_clean_linked_worktree(tmp_path):
     primary = tmp_path / "primary"
     primary.mkdir()
